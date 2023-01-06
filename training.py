@@ -1,13 +1,18 @@
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 import os
+import time
+
 from transformers import AutoTokenizer, AutoModelForCausalLM, GPT2Tokenizer, GPTJForCausalLM, DataCollatorWithPadding
 from datasets import load_dataset
+
 from ml_utils.utils import try_key
 import ml_utils
-import time
 
 def encode(examples, tokenizer, max_seq_len=100):
     sent1 = [s + tokenizer.cls_token for s in examples["sentence1"]]
@@ -69,11 +74,12 @@ class SentenceAutoEncoder(torch.nn.Module):
                 attention mask for padding purposes. 0s mean padding.
         """
         model = self.hface_model
-        inpt_embs = model.transformer.wte(data["input_ids"]).data
+        model_embs = model.transformer.get_input_embeddings()
+        inpt_embs = model_embs( data["input_ids"] ).data
         idx = data["input_ids"]==self.CLS_ID
         inpt_embs[idx] = 0
-        inpt_embs[idx] += model.transformer.wte.weight[self.CLS_ID]
-        out_embs =  model.transformer.wte(data["output_ids"]).data
+        inpt_embs[idx] += model_embs.weight[self.CLS_ID]
+        out_embs =  model_embs(data["output_ids"]).data
 
         fx = model.transformer(
             inputs_embeds=inpt_embs,
@@ -90,33 +96,80 @@ class SentenceAutoEncoder(torch.nn.Module):
         preds = model(inputs_embeds=out_embs,attention_mask=attn)
         return preds.logits
 
+class LossWrapper(torch.nn.Module):
+    """
+    This class wraps the model to keep the loss calculations distributed
+    on all GPUs. Otherwise one gpu is overloaded with computational
+    costs.
+    """
+    def __init__(self, model, tokenizer):
+        super().__init__()
+        self.model = model
+        self.tokenizer = tokenizer
+        self.loss_fxn = torch.nn.CrossEntropyLoss()
+
+    def forward(self, data):
+        """
+        data: dict
+            "input_ids": LongTensor (B,S1)
+                the token indices of the input sequence. The CLS token
+                should be appended to the end of each sentence.
+            "attention_mask": LongTensor (B,S1)
+                attention mask for padding purposes. 0s mean padding.
+            "output_ids": LongTensor (B,S2)
+                the token indices of the target sequence. An EOS token
+                should be appended to the end of each sentence
+            "output_attn_mask": LongTensor (B,S2)
+                attention mask for padding purposes. 0s mean padding.
+        """
+        preds = self.model(data)
+        preds = preds[:,:-1].reshape(-1, preds.shape[-1])
+        labels = data["output_ids"].reshape(-1)
+
+        idx = labels!=self.tokenizer.pad_token_id
+        loss = self.loss_fxn(preds[idx], labels[idx])
+        loss.backward()
+        argmax = torch.argmax(preds[idx])
+        acc = (argmax==labels[idx]).float().mean()
+        return loss, acc
+
 def train(rank, hyps, verbose=True, *args, **kwargs):
+    # Distributed Set Up
+    world_size = try_key(hyps, "n_gpus", 1)
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+
+    # Hyperparameters
     if hyps["exp_name"]=="test": 
         model_string = "hf-internal-testing/tiny-random-gptj"
     else:
         model_string = hyps["model_string"]
     max_seq_len = hyps["max_seq_len"]
     bsize = hyps["batch_size"]
+    val_bsize = try_key(hyps, "val_batch_size", bsize)
     lr = hyps["lr"]
     l2 = hyps["l2"]
     n_epochs = hyps["n_epochs"]
     hyps["seed"] = try_key(hyps, "seed", int(time.time()))
     if hyps["seed"] is None: hyps["seed"] = int(time.time())
-    torch.manual_seed(hyps["seed"])
+    torch.manual_seed(hyps["seed"]*rank)
 
-    tokenizer = GPT2Tokenizer.from_pretrained(model_string)
-    hface_model = GPTJForCausalLM.from_pretrained(model_string)
+    tokenizer = AutoTokenizer.from_pretrained(model_string)
+    hface_model = AutoModelForCausalLM.from_pretrained(
+        model_string,
+        torch_dtype=torch.float16
+    )
 
-    dataset = load_dataset("glue", "mrpc", split="train")
     new_tokens = {
         "pad_token": "[PAD]",
         "cls_token": "[CLS]", # Using CLS token as compression token
     }
     num_added = tokenizer.add_special_tokens(new_tokens)
-    n,h = hface_model.transformer.wte.weight.shape
+    n,h = hface_model.transformer.get_input_embeddings().weight.shape
     hface_model.resize_token_embeddings(n+num_added)
 
     encode_fxn = lambda x: encode(x, tokenizer, max_seq_len)
+
+    dataset = load_dataset("glue", "mrpc", split="train")
     dataset = dataset.map(encode_fxn, batched=True)
     dataset = dataset.remove_columns(
         ["sentence1", "sentence2", "idx", "label"]
@@ -125,42 +178,102 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
     dataloader = torch.utils.data.DataLoader(
         dataset, batch_size=bsize, shuffle=True
     )
+    valset = load_dataset("glue", "mrpc", split="validation")
+    valset = valset.map(encode_fxn, batched=True)
+    valset = valset.remove_columns(
+        ["sentence1", "sentence2", "idx", "label"]
+    )
+    valset.set_format(type="torch")
+    valloader = torch.utils.data.DataLoader(
+        valset, batch_size=val_bsize, shuffle=True
+    )
 
     model = SentenceAutoEncoder(hface_model, tokenizer)
-    ml_utils.training.record_session(hyps, model)
+    if rank==0:
+        ml_utils.training.record_session(hyps, model)
 
+    model.to(rank)
+    ddp_model = DDP(model, device_ids=[rank])
+    # Wrap model to distribute loss calculations
+    wrapped_model = LossWrapper(ddp_model, tokenizer)
+    #ddp_model = DDP(wrapped_model, device_ids=[rank])
+
+
+    #embs = ddp_model.model.hface_model.transformer.get_input_embeddings()
     optimizer = torch.optim.Adam(
-        model.hface_model.transformer.wte.parameters(),
+        ddp_model.parameters(),
         lr=lr,
         weight_decay=l2
     )
-    loss_fxn = torch.nn.CrossEntropyLoss()
 
-    model.cuda()
     for epoch in range(n_epochs):
-        print()
-        print("Beginning Epoch", epoch)
+        if rank==0 and verbose:
+            print()
+            print("Beginning Epoch", epoch, "--", hyps["save_folder"])
         model.train()
         avg_loss = 0
         avg_acc = 0
         for i,data in enumerate(dataloader):
-            data = {k: v.cuda() for k,v in data.items()}
-            preds = model(data)
-            preds = preds[:,:-1].reshape(-1, preds.shape[-1])
-            labels = data["output_ids"].reshape(-1)
-            idx = labels!=tokenizer.pad_token_id
-            loss = loss_fxn(preds[idx], labels[idx])
-            avg_loss += loss.item()
-            argmax = torch.argmax(preds[idx])
-            acc = (argmax==labels[idx]).float().mean()
+            optimizer.zero_grad()
+
+            data = {k: v.to(rank) for k,v in data.items()}
+
+            loss, acc = wrapped_model(data)
+
             avg_acc += acc.item()
-            if i%10==0:
+            avg_loss += loss.item()
+
+            optimizer.step()
+            if i%10==0 and rank==0 and verbose:
                 l = round(loss.item(), 5)
                 a = round(acc.item(), 5)
-                print("Loss", l, "-- Acc:", a)
-        l = round(avg_loss/i, 5)
-        a = round(avg_acc/i, 5)
-        print("Avg Loss:", l, "-- Avg Acc:", a)
-        print()
+                c = round(100*i/len(dataloader), 2)
+                s = "Loss: {} -- Acc: {} -- {}%".format( l,a,c )
+                print(s, end=len(s)*"  "+"\r")
+            if hyps["exp_name"]=="test" and i>=30: break
+        train_loss = round(avg_loss/i, 5)
+        train_acc = round(avg_acc/i, 5)
+        if rank==0 and verbose:
+            print("Avg Loss:", train_loss, "-- Avg Acc:", train_acc)
+            print("Validating...")
+
+        # Validation
+        avg_loss = 0
+        avg_acc = 0
+        if rank==0:
+            with torch.no_grad():
+                for i,data in enumerate(valloader):
+                    data = {k: v.to(rank) for k,v in data.items()}
+                    loss, acc = wrapped_model(data)
+
+                    avg_loss += loss.item()
+                    avg_acc += acc.item()
+                    if hyps["exp_name"]=="test" and i>=3: break
+            val_loss = round(avg_loss/i, 5)
+            val_acc = round(avg_acc/i, 5)
+            if rank==0 and verbose:
+                print("Val Loss:", val_loss, "-- Val Acc:", val_acc)
+                print()
+
+            optimizer.zero_grad()
+            save_dict = {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "train_acc":  train_acc,
+                "val_loss": val_loss,
+                "val_acc":  val_acc,
+                "state_dict": model.state_dict(),
+                "optim_dict": optimizer.state_dict(),
+                "hyps": hyps,
+            }
+            ml_utils.save_io.save_checkpt(
+                save_dict=save_dict,
+                save_folder=hyps["save_folder"],
+                save_name="checkpt",
+                epoch=epoch,
+                ext=".pt"
+            )
+        if hyps["exp_name"]=="test" and epoch==2: break
+    dist.destroy_process_group()
 
 
