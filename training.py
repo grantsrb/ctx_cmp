@@ -9,7 +9,7 @@ import os
 import time
 
 from transformers import AutoTokenizer, AutoModelForCausalLM, GPT2Tokenizer, GPTJForCausalLM, DataCollatorWithPadding
-from datasets import load_dataset
+import datasets
 
 from ml_utils.utils import try_key
 import ml_utils
@@ -64,6 +64,48 @@ def encode(examples, tokenizer, max_seq_len=100):
         "labels":           examples["label"],
     }
 
+def autoencode(examples, tokenizer, max_seq_len=20):
+    """
+    examples: ?
+        whatever huggingface uses when mapping an encoding function to
+        a dataset
+    tokenizer: huggingface tokenizer
+    max_seq_len: int
+        the length of the compression
+    """
+    cmps = []
+    for s in examples["text"]:
+        cmps.append(s[:max_seq_len] + tokenizer.cls_token)
+    cmps = tokenizer(
+        cmps,
+        padding="max_length",
+        max_length=max_seq_len,
+        truncation=True,
+        return_tensors="pt"
+    )
+
+    # Need to do some funny business in cases of truncation
+    idx = cmps["input_ids"]==tokenizer.cls_token_id
+    idx = (idx).float().reshape(len(idx),-1).sum(-1)
+    if idx.sum() != len(idx):
+        cmps["input_ids"][idx==0,-1] = tokenizer.cls_token_id
+
+    # Copy inputs and replace cls token
+    seqs = {
+        "input_ids": cmps["input_ids"].clone(),
+        "attention_mask": cmps["attention_mask"].clone()
+    }
+    idx = seqs["input_ids"]==tokenizer.cls_token_id
+    seqs["input_ids"][idx] = tokenizer.eos_token_id
+
+    return {
+        "input_ids":        cmps["input_ids"],
+        "attention_mask":   cmps["attention_mask"],
+        "output_ids":       seqs["input_ids"],
+        "output_attn_mask": seqs["attention_mask"]
+    }
+
+
 class SentenceAutoEncoder(torch.nn.Module):
     """
     Trains a new token type to compress a sentence into a single vector
@@ -71,12 +113,21 @@ class SentenceAutoEncoder(torch.nn.Module):
     """
     def __init__(self, model_string, rank=0, torch_dtype="float32",
                                              device_map="auto",
+                                             cmp_layer="half",
                                              *args, **kwargs):
         """
         model_string: str
             name of pretrained hugging face transformer model
         rank: int
             rank within distributed training
+        torch_dtype: torch type or str
+            the floating point precision to use
+        device_map: str
+            determines whether you want to use model parallel or not
+        cmp_layer: int, str, or None
+            the layer from the transformer to use for the compression
+            token. str argument can be 'half' denoting the middle layer
+            of the transformer. None defaults to last layer.
         """
         super().__init__()
         self.model_string = model_string
@@ -88,6 +139,7 @@ class SentenceAutoEncoder(torch.nn.Module):
             device_map=device_map
         )
         self.rank = rank
+        self.cmp_layer = cmp_layer
 
     def forward(self, data):
         """
@@ -116,10 +168,18 @@ class SentenceAutoEncoder(torch.nn.Module):
 
         fx = model.transformer(
             inputs_embeds=inpt_embs,
-            attention_mask=data["attention_mask"]
+            attention_mask=data["attention_mask"],
+            output_hidden_states=True
         )
-        early_fx_shape = fx["last_hidden_state"].shape
-        fx = fx["last_hidden_state"][idx][:,None]
+        if self.cmp_layer is None:
+            fx = fx["last_hidden_state"][idx][:,None]
+        elif self.cmp_layer=="half" or self.cmp_layer=="middle":
+            n_layers = len(fx["hidden_states"])
+            fx = fx["hidden_states"][n_layers//2][idx][:,None]
+        elif isinstance(self.cmp_layer, int):
+            fx = fx["hidden_states"][self.cmp_layer][idx][:,None]
+        else:
+            raise NotImplemented
 
         # Concat compressed representation to beginning of sentence
         attn = torch.cat(
@@ -142,7 +202,6 @@ class SentenceAutoEncoder(torch.nn.Module):
             print("idx sum:", idx.float().sum())
             print("In Embds", inpt_embs.shape)
             print("Out Embds", out_embs.shape)
-            print("early FX", early_fx_shape)
             print("FX", fx.shape)
             assert False
         
@@ -155,13 +214,21 @@ class LossWrapper(torch.nn.Module):
     on all GPUs. Otherwise one gpu is overloaded with computational
     costs.
     """
-    def __init__(self, model, tokenizer):
+    def __init__(self, model, tokenizer, loss_scale=1.):
+        """
+        loss_scale: float
+            the loss is multiplied by this value on every iteration.
+            useful as a way to normalize the learning rate when
+            performing multiple gradient computations before each
+            gradient step.
+        """
         super().__init__()
         self.model = model
         self.tokenizer = tokenizer
+        self.loss_scale = loss_scale
         self.loss_fxn = torch.nn.CrossEntropyLoss()
 
-    def forward(self, data):
+    def forward(self, data, ret_preds=False):
         """
         data: dict
             "input_ids": LongTensor (B,S1)
@@ -174,17 +241,21 @@ class LossWrapper(torch.nn.Module):
                 should be appended to the end of each sentence
             "output_attn_mask": LongTensor (B,S2)
                 attention mask for padding purposes. 0s mean padding.
+        ret_preds: bool
+            if true, will return the predictions
         """
         preds = self.model(data)
-        preds = preds[:,:-1].reshape(-1, preds.shape[-1])
+        ps = preds[:,:-1].reshape(-1, preds.shape[-1])
         labels = data["output_ids"].reshape(-1)
 
         idx = labels!=self.tokenizer.pad_token_id
-        loss = self.loss_fxn(preds[idx], labels[idx])
+        loss = self.loss_fxn(ps[idx], labels[idx])*self.loss_scale
         if self.training:
             loss.backward()
-        argmax = torch.argmax(preds[idx])
+        argmax = torch.argmax(ps[idx])
         acc = (argmax==labels[idx]).float().mean()
+        if ret_preds:
+            return loss, acc, preds
         return loss, acc
 
 def train(rank, hyps, verbose=True, *args, **kwargs):
@@ -196,10 +267,7 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
         dist.init_process_group("gloo", rank=rank, world_size=world_size)
 
     # Hyperparameters
-    if hyps["exp_name"]=="test": 
-        hyps["model_string"] = hyps["testing"]
-        print("turning 'save' to false")
-        hyps["save"] = False
+    if hyps["exp_name"]=="test": hyps["model_string"] = hyps["testing"]
     model_string = hyps["model_string"]
     max_seq_len = hyps["max_seq_len"]
     bsize = hyps["batch_size"]
@@ -236,26 +304,43 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
     n,h = embs.weight.shape
     model.hf_model.resize_token_embeddings(n+num_added)
     model.tokenizer = tokenizer
-    model.CLS_ID = model.tokenizer.cls_token_id
-    model.CLS =    model.tokenizer.cls_token
-    model.EOS_ID = model.tokenizer.eos_token_id
-    model.EOS =    model.tokenizer.eos_token
+    model.CLS_ID = tokenizer.cls_token_id
+    model.CLS =    tokenizer.cls_token
+    model.EOS_ID = tokenizer.eos_token_id
+    model.EOS =    tokenizer.eos_token
 
     # Make dataset
-    encode_fxn = lambda x: encode(x, tokenizer, max_seq_len)
-    dataset = load_dataset("glue", "mrpc", split="train")
-    dataset = dataset.map(encode_fxn, batched=True)
-    dataset = dataset.remove_columns(
-        ["sentence1", "sentence2", "idx", "label"]
-    )
+    if hyps["dataset"]=="glue":
+        encode_fxn = lambda x: encode(x, tokenizer, max_seq_len)
+        dataset = datasets.load_dataset("glue", "mrpc", split="train")
+        dataset = dataset.map(encode_fxn, batched=True)
+        dataset = dataset.remove_columns(
+            ["sentence1", "sentence2", "idx", "label"]
+        )
+        dataset.set_format(type="torch")
+        dataloader = torch.utils.data.DataLoader(
+            dataset, batch_size=bsize, shuffle=True
+        )
+        valset = datasets.load_dataset("glue", "mrpc", split="validation")
+        valset = valset.map(encode_fxn, batched=True)
+        valset = valset.remove_columns(
+            ["sentence1", "sentence2", "idx", "label"]
+        )
+    elif hyps["dataset"]=="openwebtext":
+        encode_fxn = lambda x: autoencode(x, tokenizer, max_seq_len)
+        dataset = datasets.load_dataset("openwebtext", split="train")
+        if hyps["exp_name"]=="test": 
+            dataset = dataset[:300]
+            dataset = datasets.Dataset.from_dict(dataset)
+        dataset = dataset.map(encode_fxn, batched=True)
+        dataset = dataset.remove_columns( ["text"] )
+        test_size = int(len(dataset)*.2)
+        splt = dataset.train_test_split(test_size=test_size)
+        dataset, valset = splt["train"], splt["test"]
+
     dataset.set_format(type="torch")
     dataloader = torch.utils.data.DataLoader(
         dataset, batch_size=bsize, shuffle=True
-    )
-    valset = load_dataset("glue", "mrpc", split="validation")
-    valset = valset.map(encode_fxn, batched=True)
-    valset = valset.remove_columns(
-        ["sentence1", "sentence2", "idx", "label"]
     )
     valset.set_format(type="torch")
     valloader = torch.utils.data.DataLoader(
@@ -265,7 +350,11 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
     if rank==0: ml_utils.training.record_session(hyps, model)
 
     # Wrap model to distribute loss calculations
-    wrapped_model = LossWrapper(ddp_model, tokenizer)
+    wrapped_model = LossWrapper(
+        ddp_model,
+        tokenizer,
+        loss_scale=1/hyps["n_grad_loops"]
+    )
     if not hyps["model_parallel"]:
         wrapped_model.to(rank)
     #wrapped_model.to(rank)
@@ -291,7 +380,7 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
         if rank==0 and verbose:
             print()
             print("Beginning Epoch", epoch, "--", hyps["save_folder"])
-        ddp_model.train()
+        wrapped_model.train()
         avg_loss = 0
         avg_acc = 0
         optimizer.zero_grad()
@@ -328,15 +417,30 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
             with torch.no_grad():
                 for i,data in enumerate(valloader):
                     data = {k: v.to(rank) for k,v in data.items()}
-                    loss, acc = wrapped_model(data)
+                    loss,acc,preds = wrapped_model(data, ret_preds=True)
 
                     avg_loss += loss.item()
                     avg_acc += acc.item()
                     if hyps["exp_name"]=="test" and i>=3: break
+                    max_loops = try_key(hyps,"max_val_loops",None)
+                    if max_loops is not None and i>max_loops: break
+            n_samps = 5
+            for i in range(n_samps):
+                pred = tokenizer.decode(preds[i].argmax(-1))
+                targ = tokenizer.decode(data["output_ids"][i])
+                print("Samp", i)
+                print("Preds:", pred)
+                print("Targs:", targ)
+                print()
             keys = list(data.keys())
             for k in keys: del data[k]
             val_loss = round(avg_loss/i, 5)
             val_acc = round(avg_acc/i, 5)
+            if try_key(hyps, "debug", False):
+                embs = model.hf_model.transformer.get_input_embeddings()
+                print("CLS:",  embs.weight[tokenizer.cls_token_id])
+                print("EOS:",  embs.weight[tokenizer.eos_token_id])
+                print("RAND:", embs.weight[5])
             if rank==0 and verbose:
                 print("Val Loss:", val_loss, "-- Val Acc:", val_acc)
                 print()
