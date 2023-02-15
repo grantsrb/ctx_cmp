@@ -334,6 +334,7 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
             dataset = datasets.Dataset.from_dict(dataset)
         dataset = dataset.map(encode_fxn, batched=True)
         dataset = dataset.remove_columns( ["text"] )
+        dataset = dataset.shuffle()
         test_size = int(len(dataset)*.2)
         splt = dataset.train_test_split(test_size=test_size)
         dataset, valset = splt["train"], splt["test"]
