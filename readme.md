@@ -1,5 +1,21 @@
 # Leveraging LLMs for Context Compression
 
+## Using this repo
+After cloning, you will first need to initialize the `ml_utils`
+submodule. You can do this with the following commands at the terminal:
+
+    $ cd ml_utils
+    $ git submodule init
+    $ git submodule update
+
+Next, you will need to make sure you have all necessary pacakges
+installed.
+
+Lastly, you can run a training by creating a hyperparameters.json and
+then running the following command:
+
+    # python main.py hyperparameters.json
+
 ## Hyperparameters
 
     "exp_name": str
