@@ -63,17 +63,23 @@ then running the following command:
         the learning rate
     "l2": float
         the l2 norm regularization. aka weight decay
-    "seq_len": int
-        the data sequence length to use. for causal modeling, `cmp_len`
-        tokens are subtracted from this length, so the model will
-        compress `cmp_len` tokens and then predict `seq_len`-`cmp_len`
-        tokens. if doing rmb_only, `cmp_len` is ignored
     "cmp_len": int
-        the length of the sequence that will be compressed. `cmp_len`
-        tokens are subtracted from the original sequence, so the model
-        will compress `cmp_len` tokens and then predict
-        `seq_len`-`cmp_len` tokens. if doing rmb_only, `cmp_len` is
-        ignored
+        the length of the sequence that will be compressed. if doing
+        `rmb_only`, you should use `seq_len` instead as `cmp_len` is
+        ignored.
+    "seq_len": int
+        the data sequence length to use. for causal modeling, `seq_len`
+        refers to the sequence length post compression, so the model will
+        compress `cmp_len` tokens and then predict `seq_len` tokens.
+        if doing rmb_only, `cmp_len` is ignored
+
+    "n_cmps": int
+        the number of compression tokens to use for compression
+    "cmp_layer": str or int
+        the layer of the transformer from which to take the compression
+        representation. -1 will take the last layer, "half" will take
+        from the middle layer. All integer arguments must be within
+        the number of layers of the model.
     "rmb_rask": bool
         if true, and using openwebtext dataset, model will have
         auxiliary compression autoencoding task to reconstruct the
@@ -87,8 +93,3 @@ then running the following command:
         be equivalent to stepping the optimizer once per iteration with
         a batch size of batch_size*n_grad_loops
 
-    "cmp_layer": str or int
-        the layer of the transformer from which to take the compression
-        representation. -1 will take the last layer, "half" will take
-        from the middle layer. All integer arguments must be within
-        the number of layers of the model.
