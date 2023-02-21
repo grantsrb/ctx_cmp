@@ -3,10 +3,9 @@ import datasets
 from ml_utils.utils import try_key
 import torch
 
-def owt_autoencode(examples, tokenizer, max_seq_len=20, cmp_token=None):
+def owt_autoencode(examples, tokenizer, max_seq_len=20):
     """
-    Simply predict the input sequence, bottlenecking through a single
-    cls token. Uses openwebtext.
+    Simply predict the input sequence. Uses openwebtext.
 
     Inputs:
         examples: ?
@@ -15,13 +14,8 @@ def owt_autoencode(examples, tokenizer, max_seq_len=20, cmp_token=None):
         tokenizer: huggingface tokenizer
         max_seq_len: int
             the length of the compression
-        cmp_token: str or None
-            the compression token. if none, defaults to tokenizer
-            cls_token
     """
-    if cmp_token is None:
-        cmp_token = tokenizer.cls_token
-    cmp_id = tokenizer.encode(cmp_token)[0]
+    tokenizer.padding_side = "left"
     cmps = tokenizer(
         examples["text"],
         padding="max_length",
@@ -29,17 +23,10 @@ def owt_autoencode(examples, tokenizer, max_seq_len=20, cmp_token=None):
         truncation=True,
         return_tensors="pt"
     )
-    cmps["input_ids"][:,-1] = cmp_id
-    cmps["attention_mask"][:,-1] = 1
-
-    # Copy inputs and replace cmp token
     seqs = {
         "input_ids":      cmps["input_ids"].clone(),
         "attention_mask": cmps["attention_mask"].clone()
     }
-    idx = seqs["input_ids"]==cmp_id
-    seqs["input_ids"][idx] = tokenizer.eos_token_id
-
     return {
         "input_ids":        cmps["input_ids"],
         "attention_mask":   cmps["attention_mask"],
@@ -49,8 +36,7 @@ def owt_autoencode(examples, tokenizer, max_seq_len=20, cmp_token=None):
 
 
 def owt_causal_encode(examples, tokenizer, cmp_len=20, seq_len=100,
-                                                       min_seq=5,
-                                                       cmp_token=None):
+                                                       min_seq=5):
     """
     Output tokens are the continuation of a sequence of seq_len. Inputs
     are the starting cmp_len tokens of the sequence of len seq_len.
@@ -63,25 +49,14 @@ def owt_causal_encode(examples, tokenizer, cmp_len=20, seq_len=100,
         cmp_len: int
             the length of the compression
         seq_len: int
-            the total length of the entire sequence chunk that will be
-            processed by the transformer. So, the predictive sequence
-            will be seq_len-cmp_len tokens long.
+            the length of the post compression, sequence chunk that
+            will be processed by the transformer. So, the total
+            predictive sequence will be seq_len+cmp_len tokens long.
         min_seq: int
             the minimum length predictive portion. total sequence
             lengths must be greater than or equal to cmp_len+min_seq
-        cmp_token: str or None
-            the compression token. if none, defaults to tokenizer
-            cls_token
     """
-    if cmp_token is None:
-        cmp_token = tokenizer.cls_token
-    cmp_id = tokenizer.encode(cmp_token)[0]
-    #cmp_list = []
-    #seq_list = []
-    #for s in examples["text"]:
-    #    if len(s) >= cmp_len+min_seq:
-    #        cmp_list.append(s[:cmp_len] + cmp_token)
-    #        seq_list.append(s[cmp_len:seq_len])
+    tokenizer.padding_side = "right"
     cmps = tokenizer(
         examples["text"],
         padding="max_length",
@@ -89,8 +64,6 @@ def owt_causal_encode(examples, tokenizer, cmp_len=20, seq_len=100,
         truncation=True,
         return_tensors="pt"
     )
-    cmps["input_ids"][:,cmp_len-1] = cmp_id
-    cmps["attention_mask"][:,cmp_len-1] = 1
     seqs = {
         "input_ids": cmps["input_ids"][:, cmp_len:],
         "attention_mask": cmps["attention_mask"][:, cmp_len:],
@@ -113,8 +86,7 @@ def get_loaders(hyps, tokenizer):
         encode_fxn = lambda x: pair_encode(
             x,
             tokenizer,
-            max_seq_len=hyps["cmp_len"],
-            cmp_token=hyps["CMP_TOKEN"]
+            max_seq_len=hyps["cmp_len"]
         )
         dataset = datasets.load_dataset("glue", "mrpc", split="train")
         dataset = dataset.map(encode_fxn, batched=True)
@@ -136,16 +108,14 @@ def get_loaders(hyps, tokenizer):
             encode_fxn = lambda x: owt_autoencode(
                 x,
                 tokenizer=tokenizer,
-                max_seq_len=hyps["cmp_len"],
-                cmp_token=hyps["CMP_TOKEN"]
+                max_seq_len=hyps["cmp_len"]
             )
         else:
             encode_fxn = lambda x: owt_causal_encode(
                 x,
                 tokenizer=tokenizer,
                 cmp_len=hyps["cmp_len"],
-                seq_len=hyps["seq_len"],
-                cmp_token=hyps["CMP_TOKEN"]
+                seq_len=hyps["seq_len"]
             )
         dataset = datasets.load_dataset("openwebtext", split="train")
         if hyps["exp_name"]=="test" or try_key(hyps,"abbrev_data",False):
@@ -169,32 +139,22 @@ def get_loaders(hyps, tokenizer):
     )
     return dataset, valset, dataloader, valloader
 
-def glue_encode(examples, tokenizer, max_seq_len=100, cmp_token=None):
-    if cmp_token is None:
-        cmp_token = tokenizer.cls_token
-    cmp_id = tokenizer.encode(cmp_token)[0]
-    sent1 = [s + cmp_token for s in examples["sentence1"]]
+def glue_encode(examples, tokenizer, max_seq_len=100):
+    tokenizer.padding_side = "left"
     inpts = tokenizer(
-        sent1,
+        examples["sentence1"],
         padding="max_length",
-        max_length=max_seq_len+1,
+        max_length=max_seq_len,
         truncation=True,
         return_tensors="pt"
     )
-    sent2 = [s + tokenizer.eos_token for s in examples["sentence2"]]
     outs = tokenizer(
-        sent2,
+        examples["sentence2"],
         padding="max_length",
-        max_length=max_seq_len+1,
+        max_length=max_seq_len,
         truncation=True ,
         return_tensors="pt"
     )
-
-    # Need to do some funny business in cases of truncation
-    idx = inpts["input_ids"]==cmp_id
-    idx = (idx).float().reshape(len(idx),-1).sum(-1)
-    if idx.sum() != len(idx):
-        inpts["input_ids"][idx==0,-1] = cmp_id
 
     # If sentences are not semantically equivalent, use duplicate
     # sentence, and switch cls to eos
@@ -202,17 +162,6 @@ def glue_encode(examples, tokenizer, max_seq_len=100, cmp_token=None):
     idx = examples["label"]==0
     outs["input_ids"][idx] = inpts["input_ids"][idx].clone()
     outs["attention_mask"][idx] = inpts["attention_mask"][idx].clone()
-    idx = outs["input_ids"]==cmp_id
-    outs["input_ids"][idx] = tokenizer.eos_token_id
-
-    # Need to do some funny business in cases of truncation
-    # This should largely be unnecessary because we already handled it
-    # with the inputs, but we still need to worry about the cases when
-    # the outputs are not equal to the inputs
-    idx = outs["input_ids"]==tokenizer.eos_token_id
-    idx = (idx).float().reshape(len(idx),-1).sum(-1)
-    if idx.sum() != len(idx):
-        outs["input_ids"][idx==0,-1] = tokenizer.eos_token_id
 
     return {
         "input_ids":        inpts["input_ids"],

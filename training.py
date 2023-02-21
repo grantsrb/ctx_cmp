@@ -3,345 +3,19 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-import os
 import time
 
-from transformers import AutoTokenizer, AutoModelForCausalLM, GPT2Tokenizer, GPTJForCausalLM, DataCollatorWithPadding
-import datasets
+from transformers import AutoTokenizer
 
 from ml_utils.utils import try_key
 import ml_utils
 import datas
+from models import *
 
 RMB = "|<RMB>|" # Extra characters are to ensure uniqueness
-CMP = "|<CMP>|"
+CMP = "|<CMP{}>|"
 SOS = "|<SOS>|"
 
-
-class SentenceAutoEncoder(torch.nn.Module):
-    """
-    Trains a new token type to compress a sentence into a single vector
-    representation
-    """
-    def __init__(self, model_string, rank=0, torch_dtype="float32",
-                                             device_map="auto",
-                                             cmp_layer="half",
-                                             rmb_task=False,
-                                             *args, **kwargs):
-        """
-        model_string: str
-            name of pretrained hugging face transformer model
-        rank: int
-            rank within distributed training
-        torch_dtype: torch type or str
-            the floating point precision to use
-        device_map: str
-            determines whether you want to use model parallel or not
-        cmp_layer: int, str, or None
-            the layer from the transformer to use for the compression
-            token. str argument can be 'half' denoting the middle layer
-            of the transformer. None defaults to last layer.
-        rmb_task: bool
-            if true, will assume that there is an auxiliary
-            memory reconstruction objective.
-        """
-        super().__init__()
-        self.model_string = model_string
-        if torch_dtype=="float32": torch_dtype = torch.float32
-        elif torch_dtype=="float16": torch_dtype = torch.float16
-        self.hf_model = AutoModelForCausalLM.from_pretrained(
-            self.model_string,
-            torch_dtype=torch_dtype,
-            device_map=device_map
-        )
-        self.rank = rank
-        self.cmp_layer = cmp_layer
-        self.rmb_task = rmb_task
-
-    def compress(self, input_ids, attention_mask, *args, **kwargs):
-        """
-        Compresses the input ids to a single vector.
-
-        Args: 
-            input_ids: LongTensor (B,S)
-                the token indices of the input sequence. The CMP token
-                should be appended to the end of each sentence.
-            attention_mask: LongTensor (B,S)
-                attention mask for padding purposes. 0s mean padding.
-        Returns:
-            cmpr: torch tensor (B,1,H)
-                the compressed representations
-        """
-        model = self.hf_model
-        model_embs = model.transformer.get_input_embeddings()
-        inpt_embs = model_embs( input_ids ).data
-        # Need to do this to prevent backprop into all other parameters
-        idx = input_ids==self.CMP_ID
-        inpt_embs[idx] = model_embs.weight[self.CMP_ID]
-
-        fx = model.transformer(
-            inputs_embeds=inpt_embs,
-            attention_mask=attention_mask,
-            output_hidden_states=True
-        )
-        # Get the representational layer of choice
-        if self.cmp_layer is None:
-            cmpr = fx["last_hidden_state"][idx][:,None]
-        elif self.cmp_layer=="half" or self.cmp_layer=="middle":
-            n_layers = len(fx["hidden_states"])
-            cmpr = fx["hidden_states"][n_layers//2][idx][:,None]
-        elif isinstance(self.cmp_layer, int):
-            cmpr = fx["hidden_states"][self.cmp_layer][idx][:,None]
-        else:
-            raise NotImplemented
-        return cmpr
-
-    def forward(self, data):
-        """
-        Args:
-          data: dict
-            "input_ids": LongTensor (B,S1)
-                the token indices of the input sequence. The CMP token
-                should be appended to the end of each sentence.
-            "attention_mask": LongTensor (B,S1)
-                attention mask for padding purposes. 0s mean padding.
-            "output_ids": LongTensor (B,S2)
-                the token indices of the target sequence. An EOS token
-                should be appended to the end of each sentence
-            "output_attn_mask": LongTensor (B,S2)
-                attention mask for padding purposes. 0s mean padding.
-        Returns:
-            preds: tensor (B,S2,H)
-        """
-        cmpr = self.compress(data["input_ids"], data["attention_mask"])
-
-        model = self.hf_model
-        model_embs = model.transformer.get_input_embeddings()
-        out_embs =  model_embs(data["output_ids"]).data
-
-        # Concat compressed representation and start of sentence token
-        # to beginning of sentence and pad attention accordingly
-        sos = model_embs.weight[self.SOS_ID][None,None]
-        out_embs = torch.cat(
-            [
-                cmpr.to(self.rank),
-                sos.repeat(len(cmpr),1,1),
-                out_embs.to(self.rank)
-            ],
-            dim=1
-        )
-        attn = torch.nn.functional.pad(
-            data["output_attn_mask"], (2,0), value=1
-        )
-        preds = model(inputs_embeds=out_embs,attention_mask=attn).logits
-
-        # Handle Auxiliary, Rememberance Predictions
-        if self.rmb_task:
-            # TODO: instead of eos, you should pad. don't forget the attn
-            data["input_ids"][data["input_ids"]==self.CMP_ID]=self.EOS_ID
-            out_embs = model_embs( data["input_ids"] ).data
-            try:
-                rmb = model_embs.weight[self.RMB_ID][None,None]
-                out_embs = torch.cat(
-                    [
-                        cmpr.to(self.rank),
-                        rmb.repeat(len(cmpr),1,1),
-                        out_embs
-                    ],
-                    dim=1
-                )
-                attn = torch.nn.functional.pad(
-                    data["attention_mask"], (2,0), value=1
-                )
-                rmb_preds = model(
-                    inputs_embeds=out_embs,
-                    attention_mask=attn
-                ).logits
-                return preds, rmb_preds
-            except:
-                print("og_rmb:", model_embs.weight[self.RMB_ID].shape)
-                print("rmb:", rmb.shape)
-                print("Out Embds", out_embs.shape)
-                print("attn", attn.shape)
-                print("FX", cmpr.shape)
-                print("rmb_preds", rmb_preds.shape)
-                assert False
-        return preds
-
-    def infer(self, data, pred_len=None, rmb_task=False):
-        """
-        Performs inference without teacher forcing.
-        Args:
-            data: dict (keys: str, vals: tensors)
-              "input_ids": LongTensor (B,S1)
-                  the token indices of the input sequence. The CMP token
-                  should be appended to the end of each sentence.
-              "attention_mask": LongTensor (B,S1)
-                  attention mask for padding purposes. 0s mean padding.
-              "output_ids": LongTensor (B, 1 or S2)
-                  the token indices of the target sequence.
-            pred_len: int or None
-                the number of prediction steps to perform
-            rmb_task: bool
-                
-
-        """
-        cmpr = self.compress(**data)
-        out_embs = [ cmpr.to(self.rank) ]
-
-        embs = self.hf_model.transformer.get_input_embeddings()
-        if rmb_task:
-            tsk = model_embs.weight[self.RMB_ID][None,None]
-        else:
-            tsk = model_embs.weight[self.SOS_ID][None,None]
-        out_embs.append( tsk.repeat(len(cmpr),1,1) )
-        out_embs.append( embs(data["output_ids"][:,:1]).data )
-        out_embs = torch.cat( out_embs, dim=1 )
-
-        if pred_len is None: pred_len = data["output_ids"].shape[1]
-        for i in range(pred_len):
-            pred = self.hf_model(input_embeds=out_embs).logits
-            # TODO: ALLOW SAMPLING WITH TEMPERATURE
-            pred = embs( pred[:,-1:].argmax(-1).to(self.rank) )
-            out_embs = torch.cat(
-                [out_embs, pred], dim=1
-            )
-        return out_embs
-
-class LossWrapper(torch.nn.Module):
-    """
-    This class wraps the model to keep the loss calculations distributed
-    on all GPUs. Otherwise one gpu is overloaded with computational
-    costs.
-    """
-    def __init__(self, model, tokenizer, loss_scale=1.):
-        """
-        loss_scale: float
-            the loss is multiplied by this value on every iteration.
-            useful as a way to normalize the learning rate when
-            performing multiple gradient computations before each
-            gradient step.
-        """
-        super().__init__()
-        self.model = model
-        self.tokenizer = tokenizer
-        self.loss_scale = loss_scale
-        self.loss_fxn = torch.nn.CrossEntropyLoss()
-
-    def forward(self, data, ret_preds=False):
-        """
-        Args:
-            data: dict
-                "input_ids": LongTensor (B,S1)
-                    the token indices of the input sequence. The CMP
-                    token should be appended to the end of each sentence.
-                "attention_mask": LongTensor (B,S1)
-                    attention mask for padding purposes. 0s mean padding.
-                "output_ids": LongTensor (B,S2)
-                    the token indices of the target sequence. An EOS
-                    token should be appended to the end of each sentence
-                "output_attn_mask": LongTensor (B,S2)
-                    attention mask for padding purposes. 0s mean padding.
-            ret_preds: bool
-                if true, will return the predictions
-        Returns:
-            ret_dict: dict (keys: str, vals: torch tensor)
-                "loss": torch tensor (1,)
-                "rmb_loss": torch tensor (1,)
-                    only returned if `rmb_task` is true
-                "acc": torch tensor (1,)
-                    the raw accuracy for the non-rmb task
-                "preds": torch tensor (B,S,P)
-                    the prediction logits. only returned if ret_preds is
-                    true
-                "rmb_preds": torch tensor (B,S,P)
-                    the rmb prediction logits. only returned if ret_preds
-                    is true
-        """
-        if self.model.rmb_task:
-            preds, rmb_preds = self.model(data)
-            # Need to remove CMP representation, the first element
-            ps = rmb_preds[:,1:-1].reshape(-1, preds.shape[-1])
-            labels = data["input_ids"].reshape(-1)
-            idx = (labels!=self.tokenizer.pad_token_id)
-            idx = idx&(labels!=self.model.CMP_ID)
-            rmb_loss = self.loss_fxn(ps[idx],labels[idx])*self.loss_scale
-        else:
-            preds = self.model(data)
-        # Need to remove CMP representation, the first element
-        ps = preds[:,1:-1].reshape(-1, preds.shape[-1])
-        labels = data["output_ids"].reshape(-1)
-
-        idx = labels!=self.tokenizer.pad_token_id
-        loss = self.loss_fxn(ps[idx], labels[idx])*self.loss_scale
-        if self.training: loss.backward()
-        argmax = torch.argmax(ps[idx])
-        acc = (argmax==labels[idx]).float().mean()
-        ret_dict = {
-            "loss": loss,
-            "acc": acc,
-        }
-        if self.model.rmb_task:
-            ret_dict["rmb_loss"] = rmb_loss
-            if ret_preds:
-                ret_dict["rmb_preds"] = rmb_preds[:,1:-1]
-        if ret_preds:
-            ret_dict["preds"] = preds[:,1:-1]
-        return ret_dict
-
-    def infer(self, data, ret_preds=False):
-        """
-        Use this function to make predictions during validation or
-        testing. Does not use teacher forcing.
-
-        Args:
-            data: dict
-                "input_ids": LongTensor (B,S1)
-                    the token indices of the input sequence. The CMP
-                    token should be appended to the end of each sentence.
-                "attention_mask": LongTensor (B,S1)
-                    attention mask for padding purposes. 0s mean padding.
-                "output_ids": LongTensor (B,S2)
-                    the token indices of the target sequence. An EOS
-                    token should be appended to the end of each sentence
-                "output_attn_mask": LongTensor (B,S2)
-                    attention mask for padding purposes. 0s mean padding.
-            ret_preds: bool
-                if true, will return the predictions
-        Returns:
-            loss
-        """
-        if self.model.rmb_task:
-            preds, rmb_preds = self.model(data)
-            # Need to take off first element for RMB token
-            ps = rmb_preds[:,1:-1].reshape(-1, preds.shape[-1])
-            labels = data["input_ids"].reshape(-1)
-            idx = (labels!=self.tokenizer.pad_token_id)
-            idx = idx&(labels!=self.model.CMP_ID)
-            rmb_loss = self.loss_fxn(ps[idx],labels[idx])*self.loss_scale
-        else:
-            preds = self.model(data)
-        ps = preds[:,1:-1].reshape(-1, preds.shape[-1])
-        labels = data["output_ids"].reshape(-1)
-
-        idx = labels!=self.tokenizer.pad_token_id
-        loss = self.loss_fxn(ps[idx], labels[idx])*self.loss_scale
-        if self.training: loss.backward()
-        argmax = torch.argmax(ps[idx])
-        acc = (argmax==labels[idx]).float().mean()
-        ret_dict = {
-            "loss": loss,
-            "acc": acc,
-        }
-        if self.model.rmb_task:
-            ret_dict["rmb_loss"] = rmb_loss
-            if ret_preds:
-                ret_dict["rmb_preds"] = rmb_preds[:,1:-1]
-        if ret_preds:
-            ret_dict["preds"] = preds[:,1:-1]
-        return ret_dict
 
 def train(rank, hyps, verbose=True, *args, **kwargs):
     # Distributed Set Up
@@ -374,14 +48,16 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
 
     # Make Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_string)
-    tokenizer.padding_side = "right"
     tokenizer.truncation_side = "right"
-    new_tokens = {"additional_special_tokens": [RMB, CMP, SOS]}
+    token_names = {
+        "RMB": RMB,
+        "SOS": SOS,
+        "CMPS": [CMP.format(i) for i in range(hyps["n_cmps"])]
+    }
+    new_tokens = {
+      "additional_special_tokens": [RMB, SOS] + token_names["CMPS"]
+    }
     num_added = tokenizer.add_special_tokens(new_tokens)
-    print("Tokenizer Initial Keys:")
-    print("EOS:", tokenizer.eos_token, tokenizer.eos_token_id)
-    print("BOS:", tokenizer.bos_token, tokenizer.bos_token_id)
-    print("PAD:", tokenizer.pad_token, tokenizer.pad_token_id)
     if tokenizer.pad_token is None:
         num_added += tokenizer.add_special_tokens(
             {"pad_token": "|<PAD>|"}
@@ -390,63 +66,78 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
         num_added += tokenizer.add_special_tokens(
             { "eos_token": "|<EOS>|" }
         )
+    token_names["PAD"] = tokenizer.pad_token
+    token_names["EOS"] = tokenizer.eos_token
+    print("Tokenizer Keys:")
+    print("EOS:", tokenizer.eos_token, tokenizer.eos_token_id)
+    print("BOS:", tokenizer.bos_token, tokenizer.bos_token_id)
+    print("PAD:", tokenizer.pad_token, tokenizer.pad_token_id)
 
     # Adjust Model Embeddings for new token types
     if hyps["multi_gpu"]: model = ddp_model.model
     else: model = ddp_model
-    embs = model.hf_model.transformer.get_input_embeddings()
-    n,h = embs.weight.shape
-    model.hf_model.resize_token_embeddings(n+num_added)
-    model.tokenizer = tokenizer
-    model.CMP_ID = int(tokenizer.encode(CMP)[0])
-    model.CMP =    CMP
-    hyps["CMP_TOKEN"] = CMP
-    hyps["CMP_ID"] = model.CMP_ID
-    model.RMB_ID = int(tokenizer.encode(RMB)[0])
-    model.RMB =    RMB
-    hyps["RMB_TOKEN"] = RMB
-    hyps["RMB_ID"] = model.RMB_ID
-    model.SOS_ID = int(tokenizer.encode(SOS)[0])
-    model.SOS =    SOS
-    hyps["SOS_TOKEN"] = SOS
-    hyps["SOS_ID"] = model.SOS_ID
-    model.EOS_ID = tokenizer.eos_token_id
-    model.EOS =    tokenizer.eos_token
+    model.add_embeddings(num_added)
+
+    # Add token names and ids to model and hyps
+    model.add_attrs(token_names)
+    token_ids = {}
+    for k,v in token_names.items():
+        if type(v)==type([]):
+            token_ids[k[:-1]+"_IDS"] = [
+                int(tokenizer.encode(x)[0]) for x in v
+            ]
+        else:
+            token_ids[k+"_ID"] = int(tokenizer.encode(v)[0])
+    model.add_attrs(token_ids)
+    hyps = {**hyps, "token_names": token_names, "token_ids": token_ids}
+    print("Token Names:", token_names)
+    print("Token IDs:", token_ids)
 
     # Make dataset
+    print("Collecting Data")
     dataset, valset, dataloader, valloader = datas.get_loaders(
         hyps,
         tokenizer
     )
 
+    print("Recording Session")
     if rank==0: ml_utils.training.record_session(hyps, model)
 
     # Wrap model to distribute loss calculations
+    print("Wrapping Model")
     wrapped_model = LossWrapper(
         ddp_model,
         tokenizer,
         loss_scale=1/hyps["n_grad_loops"]
     )
     if not hyps["model_parallel"]:
+        print("Putting Model On GPU")
         wrapped_model.to(rank)
     # Mayber better to parallelize after wrap, unsure at this point
     #ddp_model = DDP(wrapped_model, device_ids=[rank])
 
     # This line is crucial, otherwise you will reference stale embs
+    print("Creating Optimizer")
     embs = model.hf_model.transformer.get_input_embeddings()
     optimizer = torch.optim.Adam(
         embs.parameters(),
         lr=lr,
         weight_decay=l2
     )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, threshold=0.001
+    )
     # Turn off gradient calculations for everything except for the
     # embedding matrix.
+    print("Turning Off Gradients")
     params = set(embs.parameters())
     for name, p in ddp_model.named_parameters():
         if p not in params:
             p.requires_grad = False
 
+    print("Beginning Training")
     for epoch in range(n_epochs):
+        print("Emptying Trash")
         torch.cuda.empty_cache()
         if rank==0 and verbose:
             print()
@@ -454,6 +145,8 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
         wrapped_model.train()
         avg_loss = 0
         avg_acc = 0
+        rmb_avg_loss = 0
+        rmb_avg_acc = 0
         nloops = try_key(hyps,"n_train_loops", None)
         nloops = np.inf if nloops is None else nloops
         checkpt_mod = try_key(hyps, "checkpt_mod", None)
@@ -469,6 +162,9 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
 
             avg_acc += acc.item()
             avg_loss += loss.item()
+            if "rmb_loss" in package:
+                rmb_avg_loss += package["rmb_loss"].item()
+                rmb_avg_acc  += package["rmb_acc"].item()
 
             if i%hyps["n_grad_loops"]==0 or i==len(dataloader)-1:
                 optimizer.step()
@@ -479,8 +175,14 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
                 a = round(acc.item(), 5)
                 c = round(100*i/len(dataloader), 2)
                 t = round(time.time()-starttime, 3)
-                s = "Loss: {} -- Acc: {} -- {}% -- {}s".format(l,a,c,t)
-                print(s, end="             " + len(s)*" " + "\r")
+                s = "Loss:{} -- Acc:{}".format(l,a)
+                if "rmb_loss" in package:
+                    l = round(package["rmb_loss"].item(), 5)
+                    a = round(package["rmb_acc"].item(), 5)
+                    s += " -- RmbLoss:{} -- RmbAc:{}".format(l,a)
+                s += " -- {}% -- {}s".format(c,t)
+                #s = "Loss: {} -- Acc: {} -- {}% -- {}s".format(l,a,c,t)
+                print(s, end="          " + len(s)*" " + "\r")
             if hyps["exp_name"]=="test" and i>=30: break
             if i>nloops: break
             if i>0 and i%checkpt_mod==0 and rank==0:
@@ -516,6 +218,9 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
                     )
         train_loss = round(avg_loss/i, 5)
         train_acc = round(avg_acc/i, 5)
+        if "rmb_loss" in package:
+            rmb_train_loss = round(rmb_avg_loss/i, 5)
+            rmb_train_acc = round(rmb_avg_acc/i, 5)
         if rank==0 and verbose:
             print()
             print("Example Predictions On Training")
@@ -528,16 +233,23 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
         # Validation
         avg_loss = 0
         avg_acc = 0
+        rmb_avg_loss = 0
+        rmb_avg_acc = 0
         if rank==0:
             wrapped_model.eval()
             with torch.no_grad():
                 nloops = try_key(hyps,"max_val_loops",None)
                 for i,data in enumerate(valloader):
                     data = {k: v.to(rank) for k,v in data.items()}
-                    package = wrapped_model(data, ret_preds=True)
+                    package = wrapped_model(
+                        data, ret_preds=True, tforce=False
+                    )
                     loss = package["loss"]
                     acc = package["acc"]
                     preds = package["preds"]
+                    if "rmb_loss" in package:
+                        rmb_avg_loss += package["rmb_loss"].item()
+                        rmb_avg_acc  += package["rmb_acc"].item()
 
                     avg_loss += loss.item()
                     avg_acc += acc.item()
@@ -545,14 +257,31 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
                     if nloops is not None and i>nloops: break
             val_loss = round(avg_loss/i, 5)
             val_acc = round(avg_acc/i, 5)
+            if "rmb_loss" in package:
+                rmb_val_loss = round(rmb_avg_loss/i, 5)
+                rmb_val_acc = round(rmb_avg_acc/i, 5)
             if rank==0 and verbose:
                 print()
                 print("Example Predictions On Validation")
                 examples = print_examples(
                     data["output_ids"], preds, tokenizer
                 )
+                print()
+                print("Final Stats Epoch", epoch)
                 print("Train Loss:",train_loss,"-- Train Acc:",train_acc)
                 print("Val Loss:", val_loss, "-- Val Acc:", val_acc)
+                if "rmb_loss" in package:
+                    print("RMB Train Loss:",
+                        rmb_train_loss,
+                        "-- RMB Train Acc:",
+                        rmb_train_acc)
+                    print("RMB Val Loss:",
+                        rmb_val_loss,
+                        "-- RMB Val Acc:",
+                        rmb_val_acc)
+                print()
+                print()
+                print()
                 print()
 
             keys = list(data.keys())
@@ -564,8 +293,12 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
                     "epoch": epoch,
                     "train_loss": train_loss,
                     "train_acc":  train_acc,
-                    "val_loss": val_loss,
-                    "val_acc":  val_acc,
+                    "val_loss":   val_loss,
+                    "val_acc":    val_acc,
+                    "rmb_train_loss": rmb_train_loss,
+                    "rmb_train_acc":  rmb_train_acc,
+                    "rmb_val_loss":   rmb_val_loss,
+                    "rmb_val_acc":    rmb_val_acc,
                     "state_dict": model.state_dict(),
                     "optim_dict": optimizer.state_dict(),
                     "hyps": hyps,
@@ -579,6 +312,7 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
                     ext=".pt"
                 )
             else: print("NOT SAVING MODEL!!!!")
+            scheduler.step(val_loss)
         if hyps["exp_name"]=="test" and epoch==2: break
 
     if hyps["multi_gpu"]: dist.destroy_process_group()
@@ -606,8 +340,15 @@ def print_examples(targs, preds, tokenizer, n_samps=5):
         pred = tokenizer.decode(preds[i].argmax(-1))
         targ = tokenizer.decode(targs[i])
         print("Samp", i)
-        print("Preds:", pred.replace(tokenizer.pad_token, "").replace("\n", "\\n"))
-        print("Targs:", targ.replace(tokenizer.pad_token, ""))
+        print(
+            "Targ:",
+            targ.replace(tokenizer.pad_token, "").replace("\n", "\\n")
+        )
+        print(
+            "Pred:",
+            pred.replace(tokenizer.pad_token, "").replace("\n", "\\n")
+        )
         print()
         examples.append({"targ": targ, "pred": pred})
     return examples
+
