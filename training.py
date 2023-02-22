@@ -49,49 +49,19 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
     # Make Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_string)
     tokenizer.truncation_side = "right"
-    token_names = {
-        "RMB": RMB,
-        "SOS": SOS,
-        "CMPS": [CMP.format(i) for i in range(hyps["n_cmps"])]
-    }
-    new_tokens = {
-      "additional_special_tokens": [RMB, SOS] + token_names["CMPS"]
-    }
-    num_added = tokenizer.add_special_tokens(new_tokens)
+
+    # Add important tokens
+    num_added = 0
     if tokenizer.pad_token is None:
         num_added += tokenizer.add_special_tokens(
             {"pad_token": "|<PAD>|"}
         )
-    if tokenizer.eos_token is None:
-        num_added += tokenizer.add_special_tokens(
-            { "eos_token": "|<EOS>|" }
-        )
-    token_names["PAD"] = tokenizer.pad_token
-    token_names["EOS"] = tokenizer.eos_token
-    print("Tokenizer Keys:")
-    print("EOS:", tokenizer.eos_token, tokenizer.eos_token_id)
-    print("BOS:", tokenizer.bos_token, tokenizer.bos_token_id)
-    print("PAD:", tokenizer.pad_token, tokenizer.pad_token_id)
+    hyps["pad_token"] = tokenizer.pad_token
 
     # Adjust Model Embeddings for new token types
     if hyps["multi_gpu"]: model = ddp_model.model
     else: model = ddp_model
     model.add_embeddings(num_added)
-
-    # Add token names and ids to model and hyps
-    model.add_attrs(token_names)
-    token_ids = {}
-    for k,v in token_names.items():
-        if type(v)==type([]):
-            token_ids[k[:-1]+"_IDS"] = [
-                int(tokenizer.encode(x)[0]) for x in v
-            ]
-        else:
-            token_ids[k+"_ID"] = int(tokenizer.encode(v)[0])
-    model.add_attrs(token_ids)
-    hyps = {**hyps, "token_names": token_names, "token_ids": token_ids}
-    print("Token Names:", token_names)
-    print("Token IDs:", token_ids)
 
     # Make dataset
     print("Collecting Data")
@@ -116,9 +86,8 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
     # Mayber better to parallelize after wrap, unsure at this point
     #ddp_model = DDP(wrapped_model, device_ids=[rank])
 
-    # This line is crucial, otherwise you will reference stale embs
     print("Creating Optimizer")
-    embs = model.hf_model.transformer.get_input_embeddings()
+    embs = model.embs
     optimizer = torch.optim.Adam(
         embs.parameters(),
         lr=lr,
