@@ -72,6 +72,11 @@ then running the following command:
         refers to the sequence length post compression, so the model will
         compress `cmp_len` tokens and then predict `seq_len` tokens.
         if doing rmb_only, `cmp_len` is ignored
+    "seq_overlap": int
+        the number of non-compressed tokens overlapping with the
+        sequence of tokens that is being compressed. This is kind of
+        like a stride parameter. 0 means the stride is the full
+        compression sequence length
 
     "n_cmps": int
         the number of compression tokens to use for compression

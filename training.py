@@ -4,8 +4,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 import numpy as np
 import time
-
 from transformers import AutoTokenizer
+from tqdm import tqdm
 
 from ml_utils.utils import try_key
 import ml_utils
@@ -64,29 +64,35 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
     model.add_embeddings(num_added)
 
     # Make dataset
-    print("Collecting Data")
+    if verbose and rank==0:
+        print("Collecting Data")
     dataset, valset, dataloader, valloader = datas.get_loaders(
         hyps,
         tokenizer
     )
 
-    print("Recording Session")
+    if verbose and rank==0:
+        print("Recording Session")
     if rank==0: ml_utils.training.record_session(hyps, model)
 
     # Wrap model to distribute loss calculations
-    print("Wrapping Model")
+    if verbose and rank==0:
+        print("Wrapping Model")
     wrapped_model = LossWrapper(
         ddp_model,
         tokenizer,
+        hyps=hyps,
         loss_scale=1/hyps["n_grad_loops"]
     )
     if not hyps["model_parallel"]:
-        print("Putting Model On GPU")
+        if verbose and rank==0:
+            print("Putting Model On GPU")
         wrapped_model.to(rank)
     # Mayber better to parallelize after wrap, unsure at this point
     #ddp_model = DDP(wrapped_model, device_ids=[rank])
 
-    print("Creating Optimizer")
+    if verbose and rank==0:
+        print("Creating Optimizer")
     embs = model.embs
     optimizer = torch.optim.Adam(
         embs.parameters(),
@@ -98,7 +104,8 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
     )
     # Turn off gradient calculations for everything except for the
     # embedding matrix.
-    print("Turning Off Gradients")
+    if verbose and rank==0:
+        print("Turning Off Gradients")
     params = set(embs.parameters())
     for name, p in ddp_model.named_parameters():
         if p not in params:
@@ -117,7 +124,7 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
         rmb_avg_loss = 0
         rmb_avg_acc = 0
         nloops = try_key(hyps,"n_train_loops", None)
-        nloops = np.inf if nloops is None else nloops
+        nloops = len(dataloader) if nloops is None else nloops
         checkpt_mod = try_key(hyps, "checkpt_mod", None)
         checkpt_mod = np.inf if checkpt_mod is None else checkpt_mod
         optimizer.zero_grad()
@@ -139,21 +146,21 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
                 optimizer.step()
                 optimizer.zero_grad()
 
-            if i%10==0 and rank==0 and verbose:
+            if verbose and i%10==0 and rank==0:
                 l = round(loss.item(), 5)
                 a = round(acc.item(), 5)
-                c = round(100*i/len(dataloader), 2)
+                c = round(100*i/nloops, 2)
                 t = round(time.time()-starttime, 3)
                 s = "Loss:{} -- Acc:{}".format(l,a)
                 if "rmb_loss" in package:
                     l = round(package["rmb_loss"].item(), 5)
                     a = round(package["rmb_acc"].item(), 5)
                     s += " -- RmbLoss:{} -- RmbAc:{}".format(l,a)
-                s += " -- {}% -- {}s".format(c,t)
+                s += " -- {}% -- {}s   ".format(c,t)
                 #s = "Loss: {} -- Acc: {} -- {}% -- {}s".format(l,a,c,t)
-                print(s, end="          " + len(s)*" " + "\r")
+                print(s, end="  " + len(s)*" " + "\r")
             if hyps["exp_name"]=="test" and i>=30: break
-            if i>nloops: break
+            if i>=(nloops-1): break
             if i>0 and i%checkpt_mod==0 and rank==0:
                 if try_key(hyps, "save", True):
                     if verbose:
@@ -178,18 +185,20 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
                         "hyps": hyps,
                         "examples": examples,
                     }
+                    ep = round(epoch+i/len(dataloader), 3)
                     ml_utils.save_io.save_checkpt(
                         save_dict=save_dict,
                         save_folder=hyps["save_folder"],
                         save_name="checkpt",
-                        epoch=epoch,
+                        epoch=ep,
                         ext=".pt"
                     )
-        train_loss = round(avg_loss/i, 5)
-        train_acc = round(avg_acc/i, 5)
+        div = (i+1)
+        train_loss = round(avg_loss/div, 5)
+        train_acc = round(avg_acc/div, 5)
         if "rmb_loss" in package:
-            rmb_train_loss = round(rmb_avg_loss/i, 5)
-            rmb_train_acc = round(rmb_avg_acc/i, 5)
+            rmb_train_loss = round(rmb_avg_loss/div, 5)
+            rmb_train_acc = round(rmb_avg_acc/div, 5)
         if rank==0 and verbose:
             print()
             print("Example Predictions On Training")
@@ -224,11 +233,12 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
                     avg_acc += acc.item()
                     if hyps["exp_name"]=="test" and i>=3: break
                     if nloops is not None and i>nloops: break
-            val_loss = round(avg_loss/i, 5)
-            val_acc = round(avg_acc/i, 5)
+            div = (i+1)
+            val_loss = round(avg_loss/div, 5)
+            val_acc = round(avg_acc/div, 5)
             if "rmb_loss" in package:
-                rmb_val_loss = round(rmb_avg_loss/i, 5)
-                rmb_val_acc = round(rmb_avg_acc/i, 5)
+                rmb_val_loss = round(rmb_avg_loss/div, 5)
+                rmb_val_acc = round(rmb_avg_acc/div, 5)
             if rank==0 and verbose:
                 print()
                 print("Example Predictions On Validation")
@@ -236,7 +246,8 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
                     data["output_ids"], preds, tokenizer
                 )
                 print()
-                print("Final Stats Epoch", epoch)
+                print("Final Stats, Epoch:", epoch)
+
                 print("Train Loss:",train_loss,"-- Train Acc:",train_acc)
                 print("Val Loss:", val_loss, "-- Val Acc:", val_acc)
                 if "rmb_loss" in package:
@@ -283,7 +294,6 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
             else: print("NOT SAVING MODEL!!!!")
             scheduler.step(val_loss)
         if hyps["exp_name"]=="test" and epoch==2: break
-
     if hyps["multi_gpu"]: dist.destroy_process_group()
 
 
@@ -306,8 +316,10 @@ def print_examples(targs, preds, tokenizer, n_samps=5):
     """
     examples = []
     for i in range(min(n_samps, len(preds))):
-        pred = tokenizer.decode(preds[i].argmax(-1))
-        targ = tokenizer.decode(targs[i])
+        pred = tokenizer.decode(
+            preds[i].argmax(-1), skip_special_tokens=False
+        )
+        targ = tokenizer.decode(targs[i], skip_special_tokens=False)
         print("Samp", i)
         print(
             "Targ:",
@@ -320,4 +332,5 @@ def print_examples(targs, preds, tokenizer, n_samps=5):
         print()
         examples.append({"targ": targ, "pred": pred})
     return examples
+
 

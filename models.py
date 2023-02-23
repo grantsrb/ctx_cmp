@@ -210,6 +210,7 @@ class SentenceAutoEncoder(torch.nn.Module):
                                          cmpr=None):
         """
         Performs inference without teacher forcing.
+
         Args:
             data: dict (keys: str, vals: tensors)
               "input_ids": LongTensor (B,S1)
@@ -268,13 +269,80 @@ class SentenceAutoEncoder(torch.nn.Module):
             return torch.cat(preds, dim=1), out_embs
         return torch.cat(preds, dim=1)
 
+    def causal_lm(self, input_ids=None, attention_mask=None,
+                                        inputs_embeds=None,
+                                        tforce=True,
+                                        seed_len=3,
+                                        temperature=1):
+        """
+        Performs the traditional causal language modeling with or
+        without teacher forcing.
+
+        Args:
+            input_ids: LongTensor (B,S)
+                the token indices of the input sequence. The CMP token
+                should be appended to the end of each sentence.
+            attention_mask: LongTensor (B,S)
+                attention mask for padding purposes. 0s mean padding.
+            inputs_embeds: FloatTensor (B,S,H) optional
+                the embeddings of the inputs. If both input_ids and
+                this is argued, input_ids takes priority
+            tforce: bool
+                determines whether model should use teacher forcing for
+                predictions or not.
+            seed_len: int
+                the number of inputs to seed the non-teacher forced
+                predictions. Only applies if tforce is false
+            temperature: float
+                a temperature parameter for softmax sampling. Set to
+                low number for high confidence sampling, high value
+                for low confidence sampling
+
+        Returns:
+            preds: torch tensor (B,S,H)
+                the prediction logits
+        """
+        if tforce:
+            logits = self.hf_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                inputs_embeds=inputs_embeds,
+            ).logits
+            return logits
+
+        t_embs = self.hf_model.transformer.get_input_embeddings()
+        if input_ids is not None:
+            inputs_embeds = t_embs(input_ids[:,:seed_len])
+
+        n_loops = attention_mask.shape[1]-seed_len
+        inputs_embeds = inputs_embeds[:,:seed_len]
+        for i in range(n_loops):
+            pred = self.hf_model(
+              inputs_embeds=inputs_embeds,
+              attention_mask=attention_mask[:,:i+seed_len]
+            ).logits
+            if i == 0:
+                preds = [ pred ]
+            else:
+                preds.append(pred[:,-1:])
+            pred = pred[:,-1]
+            pred = torch.nn.functional.softmax(pred/temperature,dim=-1)
+            pred = torch.multinomial(pred,1,replacement=True)
+            pred = t_embs( pred.to(self.rank) )
+            inputs_embeds = torch.cat( [inputs_embeds, pred], dim=1 )
+        # We generally remove the final output during training, so this
+        # helps reuse the same code
+        preds.append(torch.zeros_like(preds[-1]))
+        return torch.cat(preds, dim=1)
+
+
 class LossWrapper(torch.nn.Module):
     """
     This class wraps the model to keep the loss calculations distributed
     on all GPUs. Otherwise one gpu is overloaded with computational
     costs.
     """
-    def __init__(self, model, tokenizer, loss_scale=1.):
+    def __init__(self, model, tokenizer, hyps, loss_scale=1.):
         """
         loss_scale: float
             the loss is multiplied by this value on every iteration.
@@ -287,6 +355,7 @@ class LossWrapper(torch.nn.Module):
         self.tokenizer = tokenizer
         self.loss_scale = loss_scale
         self.loss_fxn = torch.nn.CrossEntropyLoss()
+        self.hyps = hyps
 
     def forward(self, data, ret_preds=False, tforce=True):
         """
@@ -322,7 +391,7 @@ class LossWrapper(torch.nn.Module):
                     is true
         """
         n_cmps = self.model.n_cmps
-        if self.model.rmb_task:
+        if self.hyps["rmb_task"]:
             preds, rmb_preds = self.model(data, tforce=tforce)
             # Need to remove CMP representation, the first n elements
             ps = rmb_preds[:,n_cmps:-1].reshape(-1,rmb_preds.shape[-1])
@@ -340,12 +409,12 @@ class LossWrapper(torch.nn.Module):
         loss = self.loss_fxn(ps[idx], labels[idx])*self.loss_scale
         sum_loss = loss
         if self.training:
-            if self.model.rmb_task: sum_loss += rmb_loss
+            if self.hyps["rmb_task"]: sum_loss += rmb_loss
             sum_loss.backward()
         argmax = torch.argmax(ps[idx], dim=-1)
         acc = (argmax==labels[idx]).float().mean()
         ret_dict = { "loss": loss, "acc": acc, }
-        if self.model.rmb_task:
+        if self.hyps["rmb_task"]:
             ret_dict["rmb_loss"] = rmb_loss
             ret_dict["rmb_acc"] = rmb_acc
             if ret_preds:

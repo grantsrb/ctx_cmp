@@ -36,6 +36,7 @@ def owt_autoencode(examples, tokenizer, max_seq_len=20):
 
 
 def owt_causal_encode(examples, tokenizer, cmp_len=20, seq_len=100,
+                                                       overlap=0,
                                                        min_seq=5):
     """
     Output tokens are the continuation of a sequence of seq_len. Inputs
@@ -55,6 +56,9 @@ def owt_causal_encode(examples, tokenizer, cmp_len=20, seq_len=100,
         min_seq: int
             the minimum length predictive portion. total sequence
             lengths must be greater than or equal to cmp_len+min_seq
+        overlap: int
+            the number of overlapping tokens from the compression
+            sequence to the rest of the sequence.
     """
     tokenizer.padding_side = "right"
     cmps = tokenizer(
@@ -65,8 +69,8 @@ def owt_causal_encode(examples, tokenizer, cmp_len=20, seq_len=100,
         return_tensors="pt"
     )
     seqs = {
-        "input_ids": cmps["input_ids"][:, cmp_len:],
-        "attention_mask": cmps["attention_mask"][:, cmp_len:],
+        "input_ids": cmps["input_ids"][:, cmp_len-overlap:],
+        "attention_mask": cmps["attention_mask"][:, cmp_len-overlap:],
     }
     cmps["input_ids"] = cmps["input_ids"][:,:cmp_len]
     cmps["attention_mask"] = cmps["attention_mask"][:,:cmp_len]
@@ -115,15 +119,17 @@ def get_loaders(hyps, tokenizer):
                 x,
                 tokenizer=tokenizer,
                 cmp_len=hyps["cmp_len"],
-                seq_len=hyps["seq_len"]
+                seq_len=hyps["seq_len"],
+                overlap=try_key(hyps,"seq_overlap",0)
             )
         dataset = datasets.load_dataset("openwebtext", split="train")
-        if hyps["exp_name"]=="test" or try_key(hyps,"abbrev_data",False):
-            dataset = dataset[:try_key(hyps,"abbrev_len",300)]
-            dataset = datasets.Dataset.from_dict(dataset)
-        dataset = dataset.map(encode_fxn, batched=True)
-        dataset = dataset.remove_columns( ["text"] )
         dataset = dataset.shuffle()
+        abrv = try_key(hyps,"abbrev_len", 300)
+        if hyps["exp_name"]=="test" or (abrv is not None and abrv>0):
+            dataset = dataset[:abrv]
+            dataset = datasets.Dataset.from_dict(dataset)
+        dataset = dataset.map(encode_fxn, batched=True, num_proc=4)
+        dataset = dataset.remove_columns( ["text"] )
         test_size = int(len(dataset)*.2)
         splt = dataset.train_test_split(test_size=test_size)
         dataset, valset = splt["train"], splt["test"]
