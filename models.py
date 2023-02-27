@@ -150,15 +150,17 @@ class SentenceAutoEncoder(torch.nn.Module):
                 data,
                 pred_len=data["output_ids"].shape[1],
                 rmb_task=False,
-                cmpr=cmpr
-            )
+                cmpr=cmpr,
+                ret_logits=True
+            )["logits"]
             if self.rmb_task:
                 rmb_preds = self.infer(
                     data,
                     pred_len=data["input_ids"].shape[1],
                     rmb_task=True,
+                    ret_logits=True,
                     cmpr=cmpr
-                )
+                )["logits"]
                 return preds, rmb_preds
             return preds
         model = self.hf_model
@@ -180,6 +182,7 @@ class SentenceAutoEncoder(torch.nn.Module):
             data["output_attn_mask"], (npad,0), value=1
         )
         preds = model(inputs_embeds=out_embs,attention_mask=attn).logits
+        preds = preds[:,cmpr.shape[1]:-1]
 
         # Optionally Handle Auxiliary, Rememberance Predictions
         if self.rmb_task:
@@ -201,11 +204,13 @@ class SentenceAutoEncoder(torch.nn.Module):
                 inputs_embeds=out_embs,
                 attention_mask=attn
             ).logits
+            rmb_preds = rmb_preds[:,cmpr.shape[1]:-1]
             return preds, rmb_preds
         return preds
 
     def infer(self, data, pred_len=None, rmb_task=False,
                                          temperature=1,
+                                         ret_logits=False,
                                          ret_embs=False,
                                          cmpr=None):
         """
@@ -229,11 +234,22 @@ class SentenceAutoEncoder(torch.nn.Module):
                 a temperature parameter for softmax sampling. Set to
                 low number for high confidence sampling, high value
                 for low confidence sampling
+            ret_logits: bool
+                if true, will return the logits as well as the
+                predicted ids
             ret_embs: bool
                 if true, will return the embeddings as well as the
                 predictions
             cmpr: None or torch tensor
                 optional argument to reuse past compressions
+        Returns:
+            ret: dict {str: tensor}
+                preds: tensor (B,S)
+                    the prediction ids
+                logits: tensor (B,S,N)
+                    the pre-softmax id predictions
+                embs: tensor (B,S,H)
+                    the embeddings of the predictions
         """
         if cmpr is None:
             cmpr = self.compress(**data)
@@ -248,26 +264,37 @@ class SentenceAutoEncoder(torch.nn.Module):
         shape = (len(cmpr), pred_len+cmpr.shape[1])
         attn = torch.ones(shape,device=cmpr.get_device())
 
+        preds = []
+        logits = []
+        emb_list = []
+
+        past_key_values = None
         n_cmps = self.n_cmps
         t_embs = self.hf_model.transformer.get_input_embeddings()
         if pred_len is None: pred_len = data["output_ids"].shape[1]
         for i in range(pred_len):
-            pred = self.hf_model(
-              inputs_embeds=out_embs,attention_mask=attn[:,:i+n_cmps+1]
-            ).logits
-            if i == 0:
-                preds = [ pred ]
-            else:
-                preds.append(pred[:,-1:])
-            pred = pred[:,-1]
+            ret = self.hf_model(
+              inputs_embeds=out_embs,
+              attention_mask=attn[:,:out_embs.shape[1]],
+              past_key_values=past_key_values,
+              use_cache=True
+            )
+            past_key_values = ret.past_key_values
+            logits.append(ret.logits[:,-1:])
+
+            pred = logits[-1][:,-1]
             pred = torch.nn.functional.softmax(pred/temperature,dim=-1)
             pred = torch.multinomial(pred,1,replacement=True)
-            pred = t_embs( pred.to(self.rank) )
-            out_embs = torch.cat( [out_embs, pred], dim=1 )
-        preds.append(torch.zeros_like(preds[-1]))
+            preds.append(pred)
+            out_embs = t_embs( pred.to(self.rank) )
+            emb_list.append(out_embs)
+
+        ret = { "preds": torch.cat(preds,dim=1) }
+        if ret_logits:
+            ret["logits"] = torch.cat(logits, dim=1)
         if ret_embs:
-            return torch.cat(preds, dim=1), out_embs
-        return torch.cat(preds, dim=1)
+            ret["embs"] = torch.cat(emb_list, dim=1)
+        return ret
 
     def causal_lm(self, input_ids=None, attention_mask=None,
                                         inputs_embeds=None,
@@ -327,13 +354,18 @@ class SentenceAutoEncoder(torch.nn.Module):
 
         n_loops = attention_mask.shape[1]-seed_len
         inputs_embeds = inputs_embeds[:,:seed_len]
+        past_key_values = None
         logits = []
         preds = []
         for i in range(n_loops):
-            logit = self.hf_model(
+            ret = self.hf_model(
               inputs_embeds=inputs_embeds,
-              attention_mask=attention_mask[:,:i+seed_len]
-            ).logits
+              attention_mask=attention_mask[:,:inputs_embeds.shape[1]],
+              past_key_values=past_key_values,
+              use_cache=True
+            )
+            past_key_values = ret.past_key_values
+            logit = ret.logits
             if i==0:
                 logits.append(logit[:,:-1])
                 preds.append( input_ids )
@@ -342,8 +374,7 @@ class SentenceAutoEncoder(torch.nn.Module):
             pred = torch.nn.functional.softmax(pred/temperature,dim=-1)
             pred = torch.multinomial(pred,1,replacement=True)
             preds.append(pred)
-            emb = t_embs( pred.to(self.rank) )
-            inputs_embeds = torch.cat( [inputs_embeds, emb], dim=1 )
+            inputs_embeds = t_embs( pred.to(self.rank) )
         preds = torch.cat(preds,dim=1)
         if ret_logits:
             return preds, torch.cat(logits, dim=1)
@@ -408,7 +439,7 @@ class LossWrapper(torch.nn.Module):
         if self.hyps["rmb_task"]:
             preds, rmb_preds = self.model(data, tforce=tforce)
             # Need to remove CMP representation, the first n elements
-            ps = rmb_preds[:,n_cmps:-1].reshape(-1,rmb_preds.shape[-1])
+            ps = rmb_preds.reshape(-1,rmb_preds.shape[-1])
             labels = data["input_ids"].reshape(-1)
             idx = (labels!=self.tokenizer.pad_token_id)
             rmb_loss = self.loss_fxn(ps[idx],labels[idx])*self.loss_scale
@@ -417,7 +448,7 @@ class LossWrapper(torch.nn.Module):
         else:
             preds = self.model(data, tforce=tforce)
         # Need to remove CMP representation, the first n elements
-        ps = preds[:,n_cmps:-1].reshape(-1, preds.shape[-1])
+        ps = preds.reshape(-1, preds.shape[-1])
         labels = data["output_ids"].reshape(-1)
         idx = labels!=self.tokenizer.pad_token_id
         loss = self.loss_fxn(ps[idx], labels[idx])*self.loss_scale
@@ -432,8 +463,8 @@ class LossWrapper(torch.nn.Module):
             ret_dict["rmb_loss"] = rmb_loss
             ret_dict["rmb_acc"] = rmb_acc
             if ret_preds:
-                ret_dict["rmb_preds"] = rmb_preds[:,n_cmps:-1]
+                ret_dict["rmb_preds"] = rmb_preds
         if ret_preds:
-            ret_dict["preds"] = preds[:,n_cmps:-1]
+            ret_dict["preds"] = preds
         return ret_dict
 
