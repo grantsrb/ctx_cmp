@@ -114,6 +114,7 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
     print("Beginning Training")
     for epoch in range(n_epochs):
         print("Emptying Trash")
+        epochtime = time.time()
         torch.cuda.empty_cache()
         if rank==0 and verbose:
             print()
@@ -166,9 +167,16 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
                     if verbose:
                         print()
                         print("Checkpt Training Predictions")
+                        low_preds, high_preds = get_baselines(
+                            model,data,hyps,rank=rank,tforce=True
+                        )
                         examples = print_examples(
                             data["output_ids"],
-                            package["preds"],
+                            {
+                                "low": low_preds,
+                                "pred": package["preds"],
+                                "high":high_preds
+                            },
                             tokenizer
                         )
                     train_loss = round(avg_loss/i, 5)
@@ -195,17 +203,25 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
                     )
         div = (i+1)
         train_loss = round(avg_loss/div, 5)
-        train_acc = round(avg_acc/div, 5)
+        train_acc  = round(avg_acc/div, 5)
         if "rmb_loss" in package:
             rmb_train_loss = round(rmb_avg_loss/div, 5)
             rmb_train_acc = round(rmb_avg_acc/div, 5)
         if rank==0 and verbose:
             print()
             print("Example Predictions On Training")
-            examples = print_examples(
-                data["output_ids"], package["preds"], tokenizer
+            low_preds, high_preds = get_baselines(
+                model,data,hyps,rank=rank,tforce=True
             )
-            print("Validating...")
+            examples = print_examples(
+                data["output_ids"],
+                {
+                    "low": low_preds,
+                    "pred": package["preds"],
+                    "high":high_preds
+                },
+                tokenizer
+            )
         del package["preds"]
 
         # Validation
@@ -215,9 +231,13 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
         rmb_avg_acc = 0
         if rank==0:
             wrapped_model.eval()
+            if verbose:
+                print("Validating...")
             with torch.no_grad():
                 nloops = try_key(hyps,"max_val_loops",None)
+                if nloops is None: nloops = len(valloader)
                 for i,data in enumerate(valloader):
+                    starttime = time.time()
                     data = {k: v.to(rank) for k,v in data.items()}
                     package = wrapped_model(
                         data, ret_preds=True, tforce=False
@@ -232,7 +252,11 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
                     avg_loss += loss.item()
                     avg_acc += acc.item()
                     if hyps["exp_name"]=="test" and i>=3: break
-                    if nloops is not None and i>nloops: break
+                    if i>=nloops-l: break
+                    if verbose and i%20==0:
+                        p = round(100*i/nloops)
+                        t = time.time()-starttime
+                        print("{}% -- {}s".format(p,t), end="     \r")
             div = (i+1)
             val_loss = round(avg_loss/div, 5)
             val_acc = round(avg_acc/div, 5)
@@ -242,8 +266,17 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
             if rank==0 and verbose:
                 print()
                 print("Example Predictions On Validation")
+                low_preds, high_preds = get_baselines(
+                    model,data,hyps,rank=rank,tforce=False
+                )
                 examples = print_examples(
-                    data["output_ids"], preds, tokenizer
+                    data["output_ids"],
+                    {
+                        "low":  low_preds,
+                        "pred": package["preds"],
+                        "high": high_preds
+                    },
+                    tokenizer
                 )
                 print()
                 print("Final Stats, Epoch:", epoch)
@@ -259,6 +292,7 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
                         rmb_val_loss,
                         "-- RMB Val Acc:",
                         rmb_val_acc)
+                print("Epoch Dur:", round(time.time()-epochtime),"s")
                 print()
                 print()
                 print()
@@ -304,8 +338,9 @@ def print_examples(targs, preds, tokenizer, n_samps=5):
     Args:
         targs: torch tensor (B,S)
             the target tokens
-        preds: torch tensor (B,S,P)
-            the prediction logits
+        preds: dict
+            str: torch tensor (B,S,P)
+                the prediction logits
         tokenizer: huggingface tokenizer
         n_samps: int
             the number of samples to print and collect
@@ -316,21 +351,60 @@ def print_examples(targs, preds, tokenizer, n_samps=5):
     """
     examples = []
     for i in range(min(n_samps, len(preds))):
-        pred = tokenizer.decode(
-            preds[i].argmax(-1), skip_special_tokens=False
-        )
+        examp = {}
         targ = tokenizer.decode(targs[i], skip_special_tokens=False)
         print("Samp", i)
         print(
             "Targ:",
             targ.replace(tokenizer.pad_token, "").replace("\n", "\\n")
         )
-        print(
-            "Pred:",
-            pred.replace(tokenizer.pad_token, "").replace("\n", "\\n")
-        )
+        examp["targ"] = targ
+        for k,v in preds.items():
+            pred = tokenizer.decode(
+                v[i].argmax(-1), skip_special_tokens=False
+            )
+            print(
+                k+":",
+                pred.replace(tokenizer.pad_token, "").replace("\n", "\\n")
+            )
+            examp[k] = pred
         print()
         examples.append({"targ": targ, "pred": pred})
     return examples
 
+def get_baselines(model, data, hyps, rank=0, tforce=True):
+    with torch.no_grad():
+        low_inpts = {
+            "input_ids": data["output_ids"].to(rank),
+            "attention_mask": data["output_attn_mask"].to(rank),
+        }
+        low_preds =  model.causal_lm(
+            **low_inpts,
+            tforce=tforce,
+            seed_len=max(3,hyps["seq_overlap"])
+        )
 
+        high_inpts = {
+            "input_ids": torch.cat(
+              [
+                data["input_ids"].to(rank),
+                data["output_ids"].to(rank)
+              ],
+              dim=1
+            ),
+            "attention_mask": torch.cat(
+                [
+                    data["attention_mask"].to(rank),
+                    data["output_attn_mask"].to(rank)
+                ],
+                dim=1
+            )
+        }
+        high_preds = model.causal_lm(
+            **high_inpts,
+            tforce=tforce,
+            seed_len=data["input_ids"].shape[1]+max(3,hyps["seq_overlap"])
+        )
+        startx = data["input_ids"].shape[1]
+        high_preds = high_preds[:,startx:]
+    return low_preds, high_preds
