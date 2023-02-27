@@ -2,6 +2,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, GPT2Tokenizer, GPT
 import datasets
 from ml_utils.utils import try_key
 import torch
+import os
 
 def owt_autoencode(examples, tokenizer, max_seq_len=20):
     """
@@ -86,13 +87,24 @@ def get_loaders(hyps, tokenizer):
     """
     Use this function to get the training and validation loaders.
     """
-    if hyps["dataset"]=="glue":
+    path = os.path.join(hyps["data_root"],hyps["dataset"])
+    if hyps["exp_name"]=="test": path = os.path.join(path,"debug")
+    if not os.path.exists(path): os.makedirs(path)
+    if os.path.exists(os.path.join(path, "train")):
+        train_path = os.path.join(path, "train")
+        dataset = datasets.load_from_disk(train_path)
+        val_path = os.path.join(path, "val")
+        valset = datasets.load_from_disk(val_path)
+    elif hyps["dataset"]=="glue":
         encode_fxn = lambda x: pair_encode(
             x,
             tokenizer,
             max_seq_len=hyps["cmp_len"]
         )
-        dataset = datasets.load_dataset("glue", "mrpc", split="train")
+        dataset = datasets.load_dataset(
+            "glue","mrpc",split="train",
+            cache_dir=try_key(hyps,"data_cache",None)
+        )
         dataset = dataset.map(encode_fxn, batched=True)
         dataset = dataset.remove_columns(
             ["sentence1", "sentence2", "idx", "label"]
@@ -101,11 +113,16 @@ def get_loaders(hyps, tokenizer):
         dataloader = torch.utils.data.DataLoader(
             dataset, batch_size=hyps["batch_size"], shuffle=True
         )
-        valset = datasets.load_dataset("glue", "mrpc", split="validation")
+        valset = datasets.load_dataset(
+            "glue", "mrpc", split="validation",
+            cache_dir=try_key(hyps,"data_cache",None)
+        )
         valset = valset.map(encode_fxn, batched=True)
         valset = valset.remove_columns(
             ["sentence1", "sentence2", "idx", "label"]
         )
+        dataset.save_to_disk(os.path.join(path, "train"))
+        valset.save_to_disk(os.path.join(path, "val"))
     elif hyps["dataset"]=="openwebtext":
         if try_key(hyps,"rmb_only",False):
             print("RMB Only")
@@ -122,13 +139,18 @@ def get_loaders(hyps, tokenizer):
                 seq_len=hyps["seq_len"],
                 overlap=try_key(hyps,"seq_overlap",0)
             )
-        dataset = datasets.load_dataset("openwebtext", split="train")
+        dataset = datasets.load_dataset(
+            "openwebtext", split="train",
+            cache_dir=try_key(hyps,"data_cache",None),
+            num_proc=try_key(hyps,"n_data_procs",4)
+        )
         dataset = dataset.shuffle()
         abrv = try_key(hyps,"abbrev_len", 300)
         if hyps["exp_name"]=="test" or (abrv is not None and abrv>0):
             if abrv is None: abrv = 300
             dataset = dataset[:abrv]
             dataset = datasets.Dataset.from_dict(dataset)
+        print("Mapping Encoder Function")
         dataset = dataset.map(
             encode_fxn,
             batched=True,
@@ -138,6 +160,8 @@ def get_loaders(hyps, tokenizer):
         test_size = int(len(dataset)*.2)
         splt = dataset.train_test_split(test_size=test_size)
         dataset, valset = splt["train"], splt["test"]
+        dataset.save_to_disk(os.path.join(path, "train"))
+        valset.save_to_disk(os.path.join(path, "val"))
 
     dataset.set_format(type="torch")
     dataloader = torch.utils.data.DataLoader(

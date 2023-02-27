@@ -26,6 +26,10 @@ then running the following command:
     "save_root": str
         this value is prepended to the exp_name when creating the save
         folder for the hyperparameter search.
+    "data_root": str
+        the path to where the processed datasets are saved
+    "data_cache": str
+        path to where to cache the downloaded datasets
     "model_string": str
         the pretrained huggingface model you would like to use. For
         example: "bigscience/bloomz-560m"
