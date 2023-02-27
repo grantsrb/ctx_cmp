@@ -126,9 +126,14 @@ def get_loaders(hyps, tokenizer):
         dataset = dataset.shuffle()
         abrv = try_key(hyps,"abbrev_len", 300)
         if hyps["exp_name"]=="test" or (abrv is not None and abrv>0):
+            if abrv is None: abrv = 300
             dataset = dataset[:abrv]
             dataset = datasets.Dataset.from_dict(dataset)
-        dataset = dataset.map(encode_fxn, batched=True, num_proc=4)
+        dataset = dataset.map(
+            encode_fxn,
+            batched=True,
+            num_proc=try_key(hyps,"n_data_procs",4)
+        )
         dataset = dataset.remove_columns( ["text"] )
         test_size = int(len(dataset)*.2)
         splt = dataset.train_test_split(test_size=test_size)
