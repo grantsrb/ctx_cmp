@@ -45,6 +45,9 @@ then running the following command:
     "dataset": str
         a string of the huggingface datasets dataset you would like to
         use. Currently only support "openwebtext" and "glue"
+    "n_data_procs": int
+        the number of parallel processes to use for the initial
+        encoding of the data.
     "max_val_loops": int
         enforces a limit on the number of validation iterations. This
         is useful for speeding up trainings
