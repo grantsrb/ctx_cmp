@@ -87,13 +87,19 @@ def get_loaders(hyps, tokenizer):
     """
     Use this function to get the training and validation loaders.
     """
+    hyps["data_root"] = try_key(
+        hyps,"data_root",hyps["save_root"]+"datasplits"
+    )
     path = os.path.join(hyps["data_root"],hyps["dataset"])
     if hyps["exp_name"]=="test": path = os.path.join(path,"debug")
     if not os.path.exists(path): os.makedirs(path)
-    if os.path.exists(os.path.join(path, "train")):
+    abbrev = try_key(hyps, "abbrev_len", None)
+    if abbrev is None and os.path.exists(os.path.join(path,"train")):
         train_path = os.path.join(path, "train")
+        print("Loading data from", train_path)
         dataset = datasets.load_from_disk(train_path)
         val_path = os.path.join(path, "val")
+        print("Loading data from", val_path)
         valset = datasets.load_from_disk(val_path)
     elif hyps["dataset"]=="glue":
         encode_fxn = lambda x: pair_encode(
@@ -160,8 +166,9 @@ def get_loaders(hyps, tokenizer):
         test_size = int(len(dataset)*.2)
         splt = dataset.train_test_split(test_size=test_size)
         dataset, valset = splt["train"], splt["test"]
-        dataset.save_to_disk(os.path.join(path, "train"))
-        valset.save_to_disk(os.path.join(path, "val"))
+        if abbrev is None:
+            dataset.save_to_disk(os.path.join(path, "train"))
+            valset.save_to_disk(os.path.join(path, "val"))
 
     dataset.set_format(type="torch")
     dataloader = torch.utils.data.DataLoader(

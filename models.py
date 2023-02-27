@@ -273,6 +273,7 @@ class SentenceAutoEncoder(torch.nn.Module):
                                         inputs_embeds=None,
                                         tforce=True,
                                         seed_len=3,
+                                        ret_logits=False,
                                         temperature=1):
         """
         Performs the traditional causal language modeling with or
@@ -293,13 +294,17 @@ class SentenceAutoEncoder(torch.nn.Module):
             seed_len: int
                 the number of inputs to seed the non-teacher forced
                 predictions. Only applies if tforce is false
+            ret_logits: bool
+                if true, will return logits as well as prediction idxs
             temperature: float
                 a temperature parameter for softmax sampling. Set to
                 low number for high confidence sampling, high value
                 for low confidence sampling
 
         Returns:
-            preds: torch tensor (B,S,H)
+            preds: torch tensor (B,S)
+                the prediction ids
+            logits: torch tensor (B,S,H)
                 the prediction logits
         """
         if tforce:
@@ -308,32 +313,41 @@ class SentenceAutoEncoder(torch.nn.Module):
                 attention_mask=attention_mask,
                 inputs_embeds=inputs_embeds,
             ).logits
-            return logits
+            preds = logits.argmax(-1)
+            if ret_logits:
+                return preds, logits
+            return preds
 
         t_embs = self.hf_model.transformer.get_input_embeddings()
         if input_ids is not None:
-            inputs_embeds = t_embs(input_ids[:,:seed_len])
+            input_ids = input_ids[:,:seed_len]
+            inputs_embeds = t_embs(input_ids)
+        else:
+            input_ids = torch.zeros_like(inputs_embeds[:,:,0])
 
         n_loops = attention_mask.shape[1]-seed_len
         inputs_embeds = inputs_embeds[:,:seed_len]
+        logits = []
+        preds = []
         for i in range(n_loops):
-            pred = self.hf_model(
+            logit = self.hf_model(
               inputs_embeds=inputs_embeds,
               attention_mask=attention_mask[:,:i+seed_len]
             ).logits
-            if i == 0:
-                preds = [ pred ]
-            else:
-                preds.append(pred[:,-1:])
-            pred = pred[:,-1]
+            if i==0:
+                logits.append(logit[:,:-1])
+                preds.append( input_ids )
+            logits.append(logit[:,-1:])
+            pred = logit[:,-1]
             pred = torch.nn.functional.softmax(pred/temperature,dim=-1)
             pred = torch.multinomial(pred,1,replacement=True)
-            pred = t_embs( pred.to(self.rank) )
-            inputs_embeds = torch.cat( [inputs_embeds, pred], dim=1 )
-        # We generally remove the final output during training, so this
-        # helps reuse the same code
-        preds.append(torch.zeros_like(preds[-1]))
-        return torch.cat(preds, dim=1)
+            preds.append(pred)
+            emb = t_embs( pred.to(self.rank) )
+            inputs_embeds = torch.cat( [inputs_embeds, emb], dim=1 )
+        preds = torch.cat(preds,dim=1)
+        if ret_logits:
+            return preds, torch.cat(logits, dim=1)
+        return preds
 
 
 class LossWrapper(torch.nn.Module):

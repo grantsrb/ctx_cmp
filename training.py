@@ -53,9 +53,19 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
     # Add important tokens
     num_added = 0
     if tokenizer.pad_token is None:
-        num_added += tokenizer.add_special_tokens(
-            {"pad_token": "|<PAD>|"}
-        )
+        print("No Pad Token")
+        print("EOS:", tokenizer.eos_token)
+        print("BOS:", tokenizer.bos_token)
+        print("CLS:", tokenizer.cls_token)
+        if tokenizer.eos_token is not None:
+            tokenizer.add_special_tokens(
+                {"pad_token": tokenizer.eos_token}
+            )
+        else:
+            num_added += tokenizer.add_special_tokens(
+                {"pad_token": "|<PAD>|"}
+            )
+        print("PAD:", tokenizer.pad_token)
     hyps["pad_token"] = tokenizer.pad_token
 
     # Adjust Model Embeddings for new token types
@@ -171,10 +181,11 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
                             model,data,hyps,rank=rank,tforce=True
                         )
                         examples = print_examples(
+                            data["input_ids"],
                             data["output_ids"],
                             {
                                 "low": low_preds,
-                                "pred": package["preds"],
+                                "pred": package["preds"].argmax(-1),
                                 "high":high_preds
                             },
                             tokenizer
@@ -210,14 +221,16 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
         if rank==0 and verbose:
             print()
             print("Example Predictions On Training")
+            
             low_preds, high_preds = get_baselines(
                 model,data,hyps,rank=rank,tforce=True
             )
             examples = print_examples(
+                data["input_ids"],
                 data["output_ids"],
                 {
                     "low": low_preds,
-                    "pred": package["preds"],
+                    "pred": package["preds"].argmax(-1),
                     "high":high_preds
                 },
                 tokenizer
@@ -270,10 +283,11 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
                     model,data,hyps,rank=rank,tforce=False
                 )
                 examples = print_examples(
+                    data["input_ids"],
                     data["output_ids"],
                     {
                         "low":  low_preds,
-                        "pred": package["preds"],
+                        "pred": package["preds"].argmax(-1),
                         "high": high_preds
                     },
                     tokenizer
@@ -331,16 +345,18 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
     if hyps["multi_gpu"]: dist.destroy_process_group()
 
 
-def print_examples(targs, preds, tokenizer, n_samps=5):
+def print_examples(ctxs, targs, preds, tokenizer, n_samps=5):
     """
     Helper function to print the model's predictions
 
     Args:
+        ctxs: torch tensor (B,S1)
+            the ground truth of the compressed context ids
         targs: torch tensor (B,S)
-            the target tokens
+            the target ids
         preds: dict
-            str: torch tensor (B,S,P)
-                the prediction logits
+            str: torch tensor (B,S)
+                the prediction ids
         tokenizer: huggingface tokenizer
         n_samps: int
             the number of samples to print and collect
@@ -352,24 +368,24 @@ def print_examples(targs, preds, tokenizer, n_samps=5):
     examples = []
     for i in range(min(n_samps, len(preds))):
         examp = {}
-        targ = tokenizer.decode(targs[i], skip_special_tokens=False)
         print("Samp", i)
-        print(
-            "Targ:",
-            targ.replace(tokenizer.pad_token, "").replace("\n", "\\n")
-        )
+        if ctxs is not None:
+            ctx = tokenizer.decode(ctxs[i], skip_special_tokens=False)
+            ctx = ctx.replace(tokenizer.pad_token,"").replace("\n","\\n")
+            print("Ctx:", ctx)
+
+        targ = tokenizer.decode(targs[i], skip_special_tokens=False)
+        targ = targ.replace(tokenizer.pad_token, "").replace("\n","\\n")
+        print("Targ:", targ)
         examp["targ"] = targ
         for k,v in preds.items():
             pred = tokenizer.decode(
-                v[i].argmax(-1), skip_special_tokens=False
-            )
-            print(
-                k+":",
-                pred.replace(tokenizer.pad_token, "").replace("\n", "\\n")
-            )
+                v[i], skip_special_tokens=False
+            ).replace("\n", "\\n")
+            print(k+":", pred)
             examp[k] = pred
         print()
-        examples.append({"targ": targ, "pred": pred})
+        examples.append(examp)
     return examples
 
 def get_baselines(model, data, hyps, rank=0, tforce=True):
@@ -381,6 +397,7 @@ def get_baselines(model, data, hyps, rank=0, tforce=True):
         low_preds =  model.causal_lm(
             **low_inpts,
             tforce=tforce,
+            ret_logits=False,
             seed_len=max(3,hyps["seq_overlap"])
         )
 
@@ -403,8 +420,8 @@ def get_baselines(model, data, hyps, rank=0, tforce=True):
         high_preds = model.causal_lm(
             **high_inpts,
             tforce=tforce,
-            seed_len=data["input_ids"].shape[1]+max(3,hyps["seq_overlap"])
+            ret_logits=False,
+            seed_len=data["input_ids"].shape[1]+max(0,hyps["seq_overlap"])
         )
-        startx = data["input_ids"].shape[1]
-        high_preds = high_preds[:,startx:]
+        high_preds = high_preds[:,data["input_ids"].shape[1]:]
     return low_preds, high_preds
