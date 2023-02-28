@@ -26,7 +26,8 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
         dist.init_process_group("gloo", rank=rank, world_size=world_size)
 
     # Hyperparameters
-    if hyps["exp_name"]=="test": hyps["model_string"] = hyps["testing"]
+    if hyps["exp_name"]=="test" and hyps["test_model_str"] is not None:
+        hyps["model_string"] = hyps["test_model_str"]
     model_string = hyps["model_string"]
     lr = hyps["lr"]
     l2 = hyps["l2"]
