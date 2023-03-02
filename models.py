@@ -1,6 +1,8 @@
 import torch
 from transformers import AutoModelForCausalLM
 import numpy as np
+from ml_utils.utils import try_key
+
 
 class SentenceAutoEncoder(torch.nn.Module):
     """
@@ -56,6 +58,10 @@ class SentenceAutoEncoder(torch.nn.Module):
         self.cmp_ids = [i for i in range(self.n_cmps)]
         # rmb is 1, sos is 0
         self.tsk_ids = [i+self.n_cmps for i in range(self.n_tsks)]
+
+    def get_device(self):
+        t = self.hf_model.transformer
+        return t.get_input_embeddings().weight.get_device()
 
     def add_attrs(self, new_attrs):
         """
@@ -163,6 +169,7 @@ class SentenceAutoEncoder(torch.nn.Module):
                 )["logits"]
                 return preds, rmb_preds
             return preds
+
         model = self.hf_model
         model_embs = model.transformer.get_input_embeddings()
         out_embs =  model_embs(data["output_ids"])
@@ -299,7 +306,8 @@ class SentenceAutoEncoder(torch.nn.Module):
     def causal_lm(self, input_ids=None, attention_mask=None,
                                         inputs_embeds=None,
                                         tforce=True,
-                                        seed_len=3,
+                                        seed_len=None,
+                                        pred_len=None,
                                         ret_logits=False,
                                         temperature=1):
         """
@@ -318,9 +326,15 @@ class SentenceAutoEncoder(torch.nn.Module):
             tforce: bool
                 determines whether model should use teacher forcing for
                 predictions or not.
-            seed_len: int
+            seed_len: int or None
                 the number of inputs to seed the non-teacher forced
-                predictions. Only applies if tforce is false
+                predictions. Only applies if tforce is false. If None
+                is argued, uses the whole input_ids or inputs_embeds
+                as the seed.
+            pred_len: int or None
+                the number of prediction loops to perform. If None is
+                argued, assumes the sequence length of the input_ids
+                minus the seed_len.
             ret_logits: bool
                 if true, will return logits as well as prediction idxs
             temperature: float
@@ -329,9 +343,9 @@ class SentenceAutoEncoder(torch.nn.Module):
                 for low confidence sampling
 
         Returns:
-            preds: torch tensor (B,S)
+            preds: torch tensor (B,seed_len + pred_len - 1)
                 the prediction ids
-            logits: torch tensor (B,S,H)
+            logits: torch tensor (B,seed_len + pred_len - 1,H)
                 the prediction logits
         """
         if tforce:
@@ -347,13 +361,17 @@ class SentenceAutoEncoder(torch.nn.Module):
 
         t_embs = self.hf_model.transformer.get_input_embeddings()
         if input_ids is not None:
+            if seed_len is None: seed_len = input_ids.shape[1]
             input_ids = input_ids[:,:seed_len]
             inputs_embeds = t_embs(input_ids)
         else:
+            if seed_len is None: seed_len = inputs_embeds.shape[1]
+            inputs_embeds = inputs_embeds[:,:seed_len]
             input_ids = torch.zeros_like(inputs_embeds[:,:,0])
 
-        n_loops = attention_mask.shape[1]-seed_len
-        inputs_embeds = inputs_embeds[:,:seed_len]
+        if pred_len is None:
+            n_loops = attention_mask.shape[1]-seed_len
+        else: n_loops = pred_len
         past_key_values = None
         logits = []
         preds = []
@@ -368,7 +386,7 @@ class SentenceAutoEncoder(torch.nn.Module):
             logit = ret.logits
             if i==0:
                 logits.append(logit[:,:-1])
-                preds.append( input_ids )
+                preds.append( input_ids[:,1:] )
             logits.append(logit[:,-1:])
             pred = logit[:,-1]
             pred = torch.nn.functional.softmax(pred/temperature,dim=-1)
@@ -401,8 +419,13 @@ class LossWrapper(torch.nn.Module):
         self.loss_scale = loss_scale
         self.loss_fxn = torch.nn.CrossEntropyLoss()
         self.hyps = hyps
+        self.grad_clip = try_key(self.hyps, "grad_clip", 10)
 
-    def forward(self, data, ret_preds=False, tforce=True):
+    def forward(self, data, ret_preds=False, seq_len=30,
+                                             tforce=True,
+                                             gen_targs=False,
+                                             gen_ids=False,
+                                             temperature=1.):
         """
         Args:
             data: dict
@@ -416,11 +439,23 @@ class LossWrapper(torch.nn.Module):
                     token should be appended to the end of each sentence
                 "output_attn_mask": LongTensor (B,S2)
                     attention mask for padding purposes. 0s mean padding.
+            seq_len: int
+                the length of the output sequence.
             ret_preds: bool
                 if true, will return the predictions
             tforce: bool
                 determines whether model should use teacher forcing for
                 predictions or not.
+            gen_targs: bool
+                if true, the model will generate the ground truth labels
+                on the fly
+            gen_ids: bool
+                if true, the model will use the generated ids rather than
+                the logits as the ground truth
+            temperature: float
+                a temperature parameter for softmax sampling. Set to
+                low number for high confidence sampling, high value
+                for low confidence sampling
         Returns:
             ret_dict: dict (keys: str, vals: torch tensor)
                 "loss": torch tensor (1,)
@@ -435,29 +470,68 @@ class LossWrapper(torch.nn.Module):
                     the rmb prediction logits. only returned if ret_preds
                     is true
         """
+        if gen_targs: 
+            with torch.no_grad():
+                output_ids, output_logits = self.model.causal_lm(
+                    input_ids=data["input_ids"],
+                    attention_mask=data["attention_mask"],
+                    tforce=tforce,
+                    pred_len=seq_len,
+                    ret_logits=True
+                )
+            idx = seq_len + self.hyps["seq_overlap"]
+            data["output_ids"] = output_ids[:,-idx:].data
+            del output_ids
+            data["output_attn_mask"] = torch.ones_like(data["output_ids"])
+            data["output_logits"] = output_logits[:,-idx:].data
+            del output_logits
+
         n_cmps = self.model.n_cmps
         if self.hyps["rmb_task"]:
             preds, rmb_preds = self.model(data, tforce=tforce)
             # Need to remove CMP representation, the first n elements
             ps = rmb_preds.reshape(-1,rmb_preds.shape[-1])
             labels = data["input_ids"].reshape(-1)
-            idx = (labels!=self.tokenizer.pad_token_id)
+            #idx = (labels!=self.tokenizer.pad_token_id)
+            idx = data["attention_mask"].bool().reshape(-1)
             rmb_loss = self.loss_fxn(ps[idx],labels[idx])*self.loss_scale
             argmax = torch.argmax(ps[idx], dim=-1)
             rmb_acc = (argmax==labels[idx]).float().mean()
         else:
             preds = self.model(data, tforce=tforce)
+
         # Need to remove CMP representation, the first n elements
         ps = preds.reshape(-1, preds.shape[-1])
-        labels = data["output_ids"].reshape(-1)
-        idx = labels!=self.tokenizer.pad_token_id
-        loss = self.loss_fxn(ps[idx], labels[idx])*self.loss_scale
+        if gen_ids or "output_logits" not in data:
+            labels = data["output_ids"].reshape(-1)
+            idx = data["output_attn_mask"].bool().reshape(-1)
+            #idx = labels!=self.tokenizer.pad_token_id
+            ps = ps[idx]
+            labels = labels[idx]
+            loss = self.loss_fxn(ps, labels)*self.loss_scale
+        else:
+            output_logits = data["output_logits"]
+            labels = output_logits.reshape(-1, output_logits.shape[-1])
+            loss = self.loss_fxn(ps, labels)*self.loss_scale
+            labels = data["output_ids"].reshape(-1)
+
         sum_loss = loss
         if self.training:
             if self.hyps["rmb_task"]: sum_loss += rmb_loss
             sum_loss.backward()
-        argmax = torch.argmax(ps[idx], dim=-1)
-        acc = (argmax==labels[idx]).float().mean()
+            if self.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    self.parameters(),
+                    self.grad_clip
+                )
+        #print("grad shape:", self.model.embs.weight.grad.data.shape)
+        #print("grad mean:", self.model.embs.weight.grad.data.mean())
+        #print("grad max:", self.model.embs.weight.grad.data.max())
+        #print("grad min:", self.model.embs.weight.grad.data.min())
+        #print("grad norm:", self.model.embs.weight.grad.data.norm(2))
+        #print()
+        argmax = torch.argmax(ps, dim=-1)
+        acc = (argmax==labels).float().mean()
         ret_dict = { "loss": loss, "acc": acc, }
         if self.hyps["rmb_task"]:
             ret_dict["rmb_loss"] = rmb_loss
@@ -467,4 +541,5 @@ class LossWrapper(torch.nn.Module):
         if ret_preds:
             ret_dict["preds"] = preds
         return ret_dict
+
 

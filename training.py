@@ -73,13 +73,15 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
     if hyps["multi_gpu"]: model = ddp_model.model
     else: model = ddp_model
     model.add_embeddings(num_added)
+    model.to(rank)
 
     # Make dataset
     if verbose and rank==0:
         print("Collecting Data")
     dataset, valset, dataloader, valloader = datas.get_loaders(
         hyps,
-        tokenizer
+        tokenizer,
+        model=model
     )
 
     if verbose and rank==0:
@@ -137,6 +139,7 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
         rmb_avg_acc = 0
         nloops = try_key(hyps,"n_train_loops", None)
         nloops = len(dataloader) if nloops is None else nloops
+        nloops = min(nloops,len(dataloader))
         checkpt_mod = try_key(hyps, "checkpt_mod", None)
         checkpt_mod = np.inf if checkpt_mod is None else checkpt_mod
         optimizer.zero_grad()
@@ -144,7 +147,13 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
             starttime = time.time()
             data = {k: v.to(rank) for k,v in data.items()}
 
-            package = wrapped_model(data,ret_preds=True)
+            package = wrapped_model(
+                data,
+                ret_preds=True,
+                seq_len=hyps["seq_len"],
+                tforce=True,
+                gen_ids=try_key(hyps, "gen_ids", False)
+            )
             loss = package["loss"]
             acc = package["acc"]
 
@@ -254,7 +263,12 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
                     starttime = time.time()
                     data = {k: v.to(rank) for k,v in data.items()}
                     package = wrapped_model(
-                        data, ret_preds=True, tforce=False
+                        data,
+                        ret_preds=True,
+                        tforce=False,
+                        gen_targs=try_key(hyps, "gen_targs", False),
+                        seq_len=hyps["seq_len"],
+                        gen_ids=try_key(hyps, "gen_ids", False)
                     )
                     loss = package["loss"]
                     acc = package["acc"]
@@ -324,15 +338,16 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
                     "train_acc":  train_acc,
                     "val_loss":   val_loss,
                     "val_acc":    val_acc,
-                    "rmb_train_loss": rmb_train_loss,
-                    "rmb_train_acc":  rmb_train_acc,
-                    "rmb_val_loss":   rmb_val_loss,
-                    "rmb_val_acc":    rmb_val_acc,
                     "state_dict": model.state_dict(),
                     "optim_dict": optimizer.state_dict(),
                     "hyps": hyps,
                     "examples": examples,
                 }
+                if "rmb_loss" in package:
+                    save_dict["rmb_train_loss"] = rmb_train_loss
+                    save_dict["rmb_train_acc"] =  rmb_train_acc
+                    save_dict["rmb_val_loss"] =   rmb_val_loss
+                    save_dict["rmb_val_acc"] =    rmb_val_acc
                 ml_utils.save_io.save_checkpt(
                     save_dict=save_dict,
                     save_folder=hyps["save_folder"],

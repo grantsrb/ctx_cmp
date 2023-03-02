@@ -38,7 +38,8 @@ def owt_autoencode(examples, tokenizer, max_seq_len=20):
 
 def owt_causal_encode(examples, tokenizer, cmp_len=20, seq_len=100,
                                                        overlap=0,
-                                                       min_seq=5):
+                                                       min_seq=5,
+                                                       model=None):
     """
     Output tokens are the continuation of a sequence of seq_len. Inputs
     are the starting cmp_len tokens of the sequence of len seq_len.
@@ -60,6 +61,8 @@ def owt_causal_encode(examples, tokenizer, cmp_len=20, seq_len=100,
         overlap: int
             the number of overlapping tokens from the compression
             sequence to the rest of the sequence.
+        model: SentenceAutoEncoder or None
+            Will use model to generate output tokens. If None, ignored
     """
     tokenizer.padding_side = "right"
     cmps = tokenizer(
@@ -69,28 +72,48 @@ def owt_causal_encode(examples, tokenizer, cmp_len=20, seq_len=100,
         truncation=True,
         return_tensors="pt"
     )
-    seqs = {
-        "input_ids": cmps["input_ids"][:, cmp_len-overlap:],
-        "attention_mask": cmps["attention_mask"][:, cmp_len-overlap:],
-    }
+    if model is not None:
+        device = model.get_device()
+        with torch.no_grad():
+            output_ids, output_logits = model.causal_lm(
+                input_ids=cmps["input_ids"].to(device),
+                attention_mask=cmps["attention_mask"].to(device),
+                tforce=True,
+                ret_logits=True
+            )
+        idx = seq_len + overlap
+        seqs = {
+            "output_ids": cmps["input_ids"][:,-idx:],
+            "output_logits": output_logits[:,-idx:].data,
+            "output_attn_mask": cmps["attention_mask"][:,-idx:]
+        }
+    else:
+        seqs = {
+          "output_ids": cmps["input_ids"][:, cmp_len-overlap:],
+          "output_attn_mask":cmps["attention_mask"][:,cmp_len-overlap:],
+        }
     cmps["input_ids"] = cmps["input_ids"][:,:cmp_len]
     cmps["attention_mask"] = cmps["attention_mask"][:,:cmp_len]
 
-    return {
-        "input_ids":        cmps["input_ids"],
-        "attention_mask":   cmps["attention_mask"],
-        "output_ids":       seqs["input_ids"],
-        "output_attn_mask": seqs["attention_mask"]
-    }
+    return {**cmps, **seqs}
 
-def get_loaders(hyps, tokenizer):
+def get_loaders(hyps, tokenizer, model=None):
     """
     Use this function to get the training and validation loaders.
+
+    Args:
+        model: SentenceAutoEncoder
     """
     hyps["data_root"] = try_key(
         hyps,"data_root",hyps["save_root"]+"datasplits"
     )
-    path = os.path.join(hyps["data_root"],hyps["dataset"])
+    dset = hyps["dataset"]
+    if hyps["gen_targs"]:
+        dset += "modelgen"
+        model.eval()
+        hyps["n_data_procs"] = 1
+    else: model = None
+    path = os.path.join(hyps["data_root"],dset)
     if hyps["exp_name"]=="test": path = os.path.join(path,"debug")
     if not os.path.exists(path): os.makedirs(path)
     abbrev = try_key(hyps, "abbrev_len", None)
@@ -111,9 +134,10 @@ def get_loaders(hyps, tokenizer):
             "glue","mrpc",split="train",
             cache_dir=try_key(hyps,"data_cache",None)
         )
-        dataset = dataset.map(encode_fxn, batched=True)
-        dataset = dataset.remove_columns(
-            ["sentence1", "sentence2", "idx", "label"]
+        dataset = dataset.map(
+            encode_fxn,
+            batched=True,
+            remove_columns=["sentence1", "sentence2", "idx", "label"]
         )
         dataset.set_format(type="torch")
         dataloader = torch.utils.data.DataLoader(
@@ -143,7 +167,8 @@ def get_loaders(hyps, tokenizer):
                 tokenizer=tokenizer,
                 cmp_len=hyps["cmp_len"],
                 seq_len=hyps["seq_len"],
-                overlap=try_key(hyps,"seq_overlap",0)
+                overlap=try_key(hyps,"seq_overlap",0),
+                model=model
             )
         dataset = datasets.load_dataset(
             "openwebtext", split="train",
@@ -153,16 +178,19 @@ def get_loaders(hyps, tokenizer):
         dataset = dataset.shuffle()
         abrv = try_key(hyps,"abbrev_len", 300)
         if hyps["exp_name"]=="test" or (abrv is not None and abrv>0):
-            if abrv is None: abrv = 300
+            if abrv is None: abrv = 600
             dataset = dataset[:abrv]
             dataset = datasets.Dataset.from_dict(dataset)
         print("Mapping Encoder Function")
+        bsize = 1000 if model is None else\
+                try_key(hyps,"data_batch_size",100)
         dataset = dataset.map(
             encode_fxn,
             batched=True,
-            num_proc=try_key(hyps,"n_data_procs",4)
+            num_proc=try_key(hyps,"n_data_procs",4),
+            remove_columns=["text"],
+            batch_size=bsize
         )
-        dataset = dataset.remove_columns( ["text"] )
         test_size = int(len(dataset)*.2)
         splt = dataset.train_test_split(test_size=test_size)
         dataset, valset = splt["train"], splt["test"]

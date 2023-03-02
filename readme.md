@@ -49,6 +49,12 @@ then running the following command:
     "dataset": str
         a string of the huggingface datasets dataset you would like to
         use. Currently only support "openwebtext" and "glue"
+    "gen_targs": bool
+        if true, the model will generate the target tokens
+    "gen_ids": bool
+        if true, the model will use the generated ids rather than
+        the logits as the ground truth. only applies if `gen_targs` is
+        true
     "n_data_procs": int
         the number of parallel processes to use for the initial
         encoding of the data.
