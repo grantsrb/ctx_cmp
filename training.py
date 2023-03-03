@@ -58,14 +58,18 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
         print("EOS:", tokenizer.eos_token)
         print("BOS:", tokenizer.bos_token)
         print("CLS:", tokenizer.cls_token)
-        if tokenizer.eos_token is not None:
-            tokenizer.add_special_tokens(
-                {"pad_token": tokenizer.eos_token}
-            )
-        else:
-            num_added += tokenizer.add_special_tokens(
-                {"pad_token": "|<PAD>|"}
-            )
+        #if tokenizer.eos_token is not None:
+        #    tokenizer.add_special_tokens(
+        #        {"pad_token": tokenizer.eos_token}
+        #    )
+        #else:
+        #    num_added += tokenizer.add_special_tokens(
+        #        {"pad_token": "|<PAD>|"}
+        #    )
+        num_added += tokenizer.add_special_tokens({
+            "pad_token": "|<PAD>|",
+            "eos_token": "|<EOS>|",
+        })
         print("PAD:", tokenizer.pad_token)
     hyps["pad_token"] = tokenizer.pad_token
 
