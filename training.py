@@ -6,6 +6,7 @@ import numpy as np
 import time
 from transformers import AutoTokenizer
 from tqdm import tqdm
+import os
 
 from ml_utils.utils import try_key
 import ml_utils
@@ -36,14 +37,8 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
     if hyps["seed"] is None: hyps["seed"] = int(time.time())
     torch.manual_seed(hyps["seed"]*rank)
 
-    kwargs = {
-        "model_string": model_string,
-        "rank": rank,
-        "torch_dtype": hyps["torch_dtype"],
-        "device_map": "auto" if hyps["model_parallel"] else None,
-        "rmb_task": try_key(hyps, "rmb_task", False),
-    }
-    model = SentenceAutoEncoder(**kwargs)
+    hyps["device_map"] = "auto" if hyps["model_parallel"] else None
+    model = SentenceAutoEncoder(**hyps)
     if hyps["multi_gpu"]: ddp_model = DDP(model, device_ids=[rank])
     else: ddp_model = model
 
@@ -58,18 +53,18 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
         print("EOS:", tokenizer.eos_token)
         print("BOS:", tokenizer.bos_token)
         print("CLS:", tokenizer.cls_token)
-        #if tokenizer.eos_token is not None:
-        #    tokenizer.add_special_tokens(
-        #        {"pad_token": tokenizer.eos_token}
-        #    )
-        #else:
-        #    num_added += tokenizer.add_special_tokens(
-        #        {"pad_token": "|<PAD>|"}
-        #    )
-        num_added += tokenizer.add_special_tokens({
-            "pad_token": "|<PAD>|",
-            "eos_token": "|<EOS>|",
-        })
+        if tokenizer.eos_token is not None:
+            tokenizer.add_special_tokens(
+                {"pad_token": tokenizer.eos_token}
+            )
+        else:
+            num_added += tokenizer.add_special_tokens(
+                {"pad_token": "|<PAD>|"}
+            )
+        #num_added += tokenizer.add_special_tokens({
+        #    "pad_token": "|<PAD>|",
+        #    "eos_token": "|<EOS>|",
+        #})
         print("PAD:", tokenizer.pad_token)
     hyps["pad_token"] = tokenizer.pad_token
 
@@ -108,25 +103,34 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
     # Mayber better to parallelize after wrap, unsure at this point
     #ddp_model = DDP(wrapped_model, device_ids=[rank])
 
+    # Turn off gradient calculations for everything except for the
+    # embedding matrix.
+    embs = model.embs
+    if verbose and rank==0:
+        print("Turning Off Gradients")
+    params = set(embs.parameters())
+    if try_key(hyps,"train_embs",False):
+        mod = model.hf_model.transformer.get_input_embeddings()
+        params = params.union(mod.parameters())
+    if try_key(hyps,"train_lmhead",False):
+        mod = model.hf_model.lm_head
+        params = params.union(mod.parameters())
+    for name, p in ddp_model.named_parameters():
+        if p not in params:
+            p.requires_grad = False
+        else:
+            print(name, "gradients on")
+
     if verbose and rank==0:
         print("Creating Optimizer")
-    embs = model.embs
     optimizer = torch.optim.Adam(
-        embs.parameters(),
+        params,
         lr=lr,
         weight_decay=l2
     )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, threshold=0.001
+        optimizer, threshold=0.001, patience=try_key(hyps,"patience",10)
     )
-    # Turn off gradient calculations for everything except for the
-    # embedding matrix.
-    if verbose and rank==0:
-        print("Turning Off Gradients")
-    params = set(embs.parameters())
-    for name, p in ddp_model.named_parameters():
-        if p not in params:
-            p.requires_grad = False
 
     print("Beginning Training")
     for epoch in range(n_epochs):
@@ -135,7 +139,11 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
         torch.cuda.empty_cache()
         if rank==0 and verbose:
             print()
-            print("Beginning Epoch", epoch, "--", hyps["save_folder"])
+            s = "Beginning Epoch {} -- {}".format(
+                epoch, hyps["save_folder"]
+            )
+            print(s)
+            logstr = s + "\n"
         wrapped_model.train()
         avg_loss = 0
         avg_acc = 0
@@ -146,6 +154,7 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
         nloops = min(nloops,len(dataloader))
         checkpt_mod = try_key(hyps, "checkpt_mod", None)
         checkpt_mod = np.inf if checkpt_mod is None else checkpt_mod
+        val_mod = try_key(hyps, "val_mod", 1)
         optimizer.zero_grad()
         for i,data in enumerate(dataloader):
             starttime = time.time()
@@ -168,6 +177,12 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
                 rmb_avg_acc  += package["rmb_acc"].item()
 
             if i%hyps["n_grad_loops"]==0 or i==len(dataloader)-1:
+                if try_key(hyps,"grad_scaling",False):
+                    model.embs.weight.grad.data = temp/temp.norm(2)
+                #temp = model.embs.weight.grad.data
+                #print("abs grad mean:",  temp.abs().mean(-1))
+                #print("grad norm:",      temp.norm(2))
+                #print()
                 optimizer.step()
                 optimizer.zero_grad()
 
@@ -190,20 +205,26 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
                 if try_key(hyps, "save", True):
                     if verbose:
                         print()
-                        print("Checkpt Training Predictions")
+                        s = "Checkpt Training Predictions"
+                        print(s)
                         low_preds, high_preds = get_baselines(
-                            model,data,hyps,rank=rank,tforce=True
+                            model,data,hyps,
+                            rank=rank,tforce=True,to_cpu=True
                         )
-                        examples = print_examples(
-                            data["input_ids"],
-                            data["output_ids"],
-                            {
-                                "low": low_preds,
-                                "pred": package["preds"].argmax(-1),
-                                "high":high_preds
-                            },
+                        inpt_dict = {
+                            "input_ids": data["input_ids"],
+                            "output_ids": data["output_ids"],
+                            **package,
+                            "low": low_preds, "high": high_preds
+                        }
+                        examples, s = print_examples(
+                            inpt_dict,
                             tokenizer
                         )
+                        keys = list(inpt_dict.keys())
+                        for k in keys:
+                            inpt_dict[k] = inpt_dict[k].cpu()
+                        del inpt_dict
                     train_loss = round(avg_loss/i, 5)
                     train_acc = round(avg_acc/i, 5)
                     save_dict = {
@@ -234,21 +255,24 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
             rmb_train_acc = round(rmb_avg_acc/div, 5)
         if rank==0 and verbose:
             print()
-            print("Example Predictions On Training")
-            
+            s = "Example Predictions On Training"
+            print(s)
+            logstr += s + "\n"
             low_preds, high_preds = get_baselines(
-                model,data,hyps,rank=rank,tforce=True
+                model,data,hyps,rank=rank,tforce=True,to_cpu=True
             )
-            examples = print_examples(
-                data["input_ids"],
-                data["output_ids"],
-                {
-                    "low": low_preds,
-                    "pred": package["preds"].argmax(-1),
-                    "high":high_preds
-                },
-                tokenizer
-            )
+            inpt_dict = {
+                "input_ids":  data["input_ids"],
+                "output_ids": data["output_ids"],
+                **package,
+                "low": low_preds, "high": high_preds
+            }
+            examples,s = print_examples( inpt_dict, tokenizer )
+            logstr += s + "\n"
+            keys = list(inpt_dict.keys())
+            for k in keys:
+                inpt_dict[k] = inpt_dict[k].cpu()
+            del inpt_dict
         del package["preds"]
 
         # Validation
@@ -256,7 +280,7 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
         avg_acc = 0
         rmb_avg_loss = 0
         rmb_avg_acc = 0
-        if rank==0:
+        if rank==0 and epoch%val_mod==0:
             wrapped_model.eval()
             if verbose:
                 print("Validating...")
@@ -297,37 +321,53 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
                 rmb_val_acc = round(rmb_avg_acc/div, 5)
             if rank==0 and verbose:
                 print()
-                print("Example Predictions On Validation")
+                s = "Example Predictions On Validation"
+                print(s)
+                logstr += s + "\n"
                 low_preds, high_preds = get_baselines(
-                    model,data,hyps,rank=rank,tforce=False
+                    model,data,hyps,rank=rank,tforce=False,to_cpu=True
                 )
-                examples = print_examples(
-                    data["input_ids"],
-                    data["output_ids"],
-                    {
-                        "low":  low_preds,
-                        "pred": package["preds"].argmax(-1),
-                        "high": high_preds
-                    },
-                    tokenizer
-                )
+                inpt_dict = {
+                    "input_ids": data["input_ids"],
+                    "output_ids": data["output_ids"],
+                    **package,
+                    "low": low_preds, "high": high_preds
+                }
+                examples,s = print_examples( inpt_dict, tokenizer )
+                keys = list(inpt_dict.keys())
+                for k in keys:
+                    inpt_dict[k] = inpt_dict[k].cpu()
+                del inpt_dict
+                logstr += s + "\n"
                 print()
-                print("Final Stats, Epoch:", epoch)
+                s = "Final Stats, Epoch: {}".format(epoch)
+                print(s)
+                logstr += "\n" + s + "\n"
 
-                print("Train Loss:",train_loss,"-- Train Acc:",train_acc)
-                print("Val Loss:", val_loss, "-- Val Acc:", val_acc)
+                s = "Train Loss: {} -- Train Acc: {}".format(
+                    train_loss,train_acc
+                )
+                print(s)
+                logstr += s + "\n"
+                s = "Val Loss: {} -- Val Acc: {}".format(
+                    val_loss,val_acc
+                )
+                print(s)
+                logstr += s + "\n"
                 if "rmb_loss" in package:
-                    print("RMB Train Loss:",
-                        rmb_train_loss,
-                        "-- RMB Train Acc:",
-                        rmb_train_acc)
-                    print("RMB Val Loss:",
-                        rmb_val_loss,
-                        "-- RMB Val Acc:",
-                        rmb_val_acc)
-                print("Epoch Dur:", round(time.time()-epochtime),"s")
-                print()
-                print()
+                    s = "RMB Train Loss: {} -- RMB Train Acc: {}".format(
+                        rmb_train_loss, rmb_train_acc
+                    )
+                    print(s)
+                    logstr += s + "\n"
+                    s = "RMB Val Loss: {} -- RMB Val Acc: {}".format(
+                        rmb_val_loss, rmb_val_acc
+                    )
+                    print(s)
+                    logstr += s + "\n"
+                s = "Epoch Dur: {}s".format(round(time.time()-epochtime))
+                logstr += s + "\n\n\n\n"
+                print(s)
                 print()
                 print()
 
@@ -359,24 +399,33 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
                     epoch=epoch,
                     ext=".pt"
                 )
+                save_training_log(hyps, logstr)
             else: print("NOT SAVING MODEL!!!!")
             scheduler.step(val_loss)
+        keys = list(package.keys())
+        for k in keys: del package[k]
         if hyps["exp_name"]=="test" and epoch==2: break
     if hyps["multi_gpu"]: dist.destroy_process_group()
 
 
-def print_examples(ctxs, targs, preds, tokenizer, n_samps=5):
+def print_examples(inpt_dict, tokenizer, n_samps=5):
     """
     Helper function to print the model's predictions
 
     Args:
-        ctxs: torch tensor (B,S1)
-            the ground truth of the compressed context ids
-        targs: torch tensor (B,S)
-            the target ids
-        preds: dict
-            str: torch tensor (B,S)
-                the prediction ids
+        inpt_dict: dict {str: tensor (B,Sn)}
+            input_ids: torch tensor (B,S1)
+                the ground truth of the compressed context ids
+            output_ids: torch tensor (B,S2)
+                the target ids
+            rmb_pred: torch tensor (B,S1,L)
+                the predicted compressed context logits
+            low: torch tensor (B,S1)
+                the predicted target ids with no prepended information
+            pred: torch tensor (B,S1,L)
+                the predicted compressed context logits
+            high: torch tensor (B,S1)
+                the predicted target ids with all prepended information
         tokenizer: huggingface tokenizer
         n_samps: int
             the number of samples to print and collect
@@ -384,31 +433,82 @@ def print_examples(ctxs, targs, preds, tokenizer, n_samps=5):
         examples: list of dicts of str
             a list of the printed examples. the dicts have keys of
             "targs" and "preds"
+        logstr: str
+            a single string of one printout loop
     """
+    tensors = []
+    if "input_ids" in inpt_dict:
+        ctxs = inpt_dict["input_ids"]
+        tensors.append(ctxs)
+    if "rmb_preds" in inpt_dict:
+        rmbs = inpt_dict["rmb_preds"].argmax(-1)
+        tensors.append(rmbs)
+    targs = inpt_dict["output_ids"]
+    tensors.append(targs)
+    preds = {
+        "low":  inpt_dict["low"],
+        "pred": inpt_dict["preds"].argmax(-1),
+        "high": inpt_dict["high"],
+    }
+    tensors = tensors + [v for v in preds.values()]
+
+    lens = []
+    l = min([len(t) for t in tensors])
+    logstr = ""
     examples = []
-    for i in range(min(n_samps, len(preds))):
+    for i in range(min(n_samps, l)):
         examp = {}
         print("Samp", i)
-        if ctxs is not None:
+        if "input_ids" in inpt_dict:
             ctx = tokenizer.decode(ctxs[i], skip_special_tokens=False)
             ctx = ctx.replace(tokenizer.pad_token,"").replace("\n","\\n")
-            print("Ctx:", ctx)
+            examp["ctx"] = ctx
+            s = "Ctx: " +  ctx
+            if i == 0:
+                logstr += s + "\n"
+            print(s)
+
+        if "rmb_preds" in inpt_dict:
+            rmb = tokenizer.decode(rmbs[i], skip_special_tokens=False)
+            rmb = rmb.replace(tokenizer.pad_token,"").replace("\n","\\n")
+            examp["rmb"] = rmb
+            s = "RMB: " +  rmb
+            if i == 0:
+                logstr += s + "\n"
+            print(s)
 
         targ = tokenizer.decode(targs[i], skip_special_tokens=False)
         targ = targ.replace(tokenizer.pad_token, "").replace("\n","\\n")
-        print("Targ:", targ)
+        s = "Targ: " +  targ
+        if i == 0:
+            logstr += s + "\n"
+        print(s)
         examp["targ"] = targ
         for k,v in preds.items():
             pred = tokenizer.decode(
                 v[i], skip_special_tokens=False
             ).replace("\n", "\\n")
-            print(k+":", pred)
+            s = k + ": " + pred
+            if i == 0:
+                logstr += s + "\n"
+            print(s)
             examp[k] = pred
         print()
         examples.append(examp)
-    return examples
+    return examples, logstr
 
-def get_baselines(model, data, hyps, rank=0, tforce=True):
+def get_baselines(model, data, hyps, rank=0, tforce=True, to_cpu=True):
+    """
+    model: SentenceAutoEncoder
+    data: dict {str: tensor}
+        input_ids: tensor
+        attention_mask: tensor
+    hyps: dict
+    rank: int
+    tforce: bool
+    to_cpu: bool
+        if true, returns tensors on cpu
+    """
     with torch.no_grad():
         low_inpts = {
             "input_ids": data["output_ids"].to(rank),
@@ -423,18 +523,15 @@ def get_baselines(model, data, hyps, rank=0, tforce=True):
 
         high_inpts = {
             "input_ids": torch.cat(
-              [
-                data["input_ids"].to(rank),
-                data["output_ids"].to(rank)
-              ],
+              [ data["input_ids"].to(rank), data["output_ids"].to(rank) ],
               dim=1
             ),
             "attention_mask": torch.cat(
-                [
-                    data["attention_mask"].to(rank),
-                    data["output_attn_mask"].to(rank)
-                ],
-                dim=1
+              [ 
+                data["attention_mask"].to(rank),
+                data["output_attn_mask"].to(rank)
+              ],
+              dim=1
             )
         }
         high_preds = model.causal_lm(
@@ -444,4 +541,24 @@ def get_baselines(model, data, hyps, rank=0, tforce=True):
             seed_len=data["input_ids"].shape[1]+max(0,hyps["seq_overlap"])
         )
         high_preds = high_preds[:,data["input_ids"].shape[1]:]
+    if to_cpu:
+        low_preds = low_preds.cpu()
+        high_preds = high_preds.cpu()
     return low_preds, high_preds
+
+def save_training_log(hyps, logstr, fname="training_log.txt", reset=False):
+    """
+    Saves the logstr to the save folder under the name training_log.txt
+
+    hyps: dict
+    logstr: str
+        the string to save
+    fname: str
+        the name of the file to save to
+    reset: bool
+        if true, resets the training log and then writes. otherwise
+        appends to training log
+    """
+    mode = "w" if reset else "a"
+    with open(os.path.join(hyps["save_folder"], fname),mode) as f:
+        f.write(logstr)

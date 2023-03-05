@@ -68,6 +68,11 @@ then running the following command:
         during training, the model will be saved every `checkpt_mod`
         iterations
 
+    "train_lmhead": bool
+        if true, the final output layer is trainable
+    "train_embs": bool
+        if true, the embedding layer is trainable
+
     "n_epochs": int
         the total number of training iterations
     "batch_size": int

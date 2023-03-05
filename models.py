@@ -15,6 +15,8 @@ class SentenceAutoEncoder(torch.nn.Module):
                                              rmb_task=False,
                                              n_cmps=3,
                                              n_tsks=2,
+                                             train_embs=False,
+                                             train_lmhead=False,
                                              *args, **kwargs):
         """
         model_string: str
@@ -37,6 +39,9 @@ class SentenceAutoEncoder(torch.nn.Module):
         n_tsks: int
             the number of task tokens. for the task ids, rmb is 1, sos
             is 0
+        train_embs: bool
+            if false, uses data of transformer embedding parameters
+            instead of embedding parameters directly.
         """
         super().__init__()
         self.model_string = model_string
@@ -56,8 +61,9 @@ class SentenceAutoEncoder(torch.nn.Module):
         hsize = t.get_input_embeddings().weight.shape[-1]
         self.embs = torch.nn.Embedding(self.n_cmps+self.n_tsks, hsize)
         self.cmp_ids = [i for i in range(self.n_cmps)]
-        # rmb is 1, sos is 0
+        # sos is 0, rmb is 1
         self.tsk_ids = [i+self.n_cmps for i in range(self.n_tsks)]
+        self.train_embs = train_embs
 
     def get_device(self):
         t = self.hf_model.transformer
@@ -104,6 +110,7 @@ class SentenceAutoEncoder(torch.nn.Module):
         # inpt_embs are padded on left side, so we can append the cmp
         # tokens to the right side and pad the attention
         inpt_embs = model_embs( input_ids )
+        if self.train_embs: inpt_embs = inpt_embs.data
         cmp_embs = self.embs.weight[self.cmp_ids[0]:self.cmp_ids[-1]+1]
         inpt_embs = torch.cat(
             [inpt_embs, cmp_embs[None].repeat(len(inpt_embs),1,1)],
@@ -173,6 +180,7 @@ class SentenceAutoEncoder(torch.nn.Module):
         model = self.hf_model
         model_embs = model.transformer.get_input_embeddings()
         out_embs =  model_embs(data["output_ids"])
+        if self.train_embs: out_embs = out_embs.data
         # Concat compressed representation and start of sentence token
         # to beginning of sentence and pad attention accordingly
         sos = self.embs.weight[self.tsk_ids[0]][None,None]
@@ -193,8 +201,8 @@ class SentenceAutoEncoder(torch.nn.Module):
 
         # Optionally Handle Auxiliary, Rememberance Predictions
         if self.rmb_task:
-            out_embs = model_embs( data["input_ids"] ).data
-            rmb = model_embs.weight[self.tsk_ids[1]][None,None]
+            out_embs = model_embs( data["input_ids"] )
+            rmb = self.embs.weight[self.tsk_ids[1]][None,None]
             out_embs = torch.cat(
                 [
                     cmpr.to(self.rank),
@@ -294,6 +302,7 @@ class SentenceAutoEncoder(torch.nn.Module):
             pred = torch.multinomial(pred,1,replacement=True)
             preds.append(pred)
             out_embs = t_embs( pred.to(self.rank) )
+            if self.train_embs: out_embs = out_embs.data
             emb_list.append(out_embs)
 
         ret = { "preds": torch.cat(preds,dim=1) }
@@ -368,6 +377,7 @@ class SentenceAutoEncoder(torch.nn.Module):
             if seed_len is None: seed_len = inputs_embeds.shape[1]
             inputs_embeds = inputs_embeds[:,:seed_len]
             input_ids = torch.zeros_like(inputs_embeds[:,:,0])
+        if self.train_embs: inputs_embeds = inputs_embeds.data
 
         if pred_len is None:
             n_loops = attention_mask.shape[1]-seed_len
@@ -393,6 +403,7 @@ class SentenceAutoEncoder(torch.nn.Module):
             pred = torch.multinomial(pred,1,replacement=True)
             preds.append(pred)
             inputs_embeds = t_embs( pred.to(self.rank) )
+            if self.train_embs: inputs_embeds = inputs_embeds.data
         preds = torch.cat(preds,dim=1)
         if ret_logits:
             return preds, torch.cat(logits, dim=1)
@@ -471,6 +482,7 @@ class LossWrapper(torch.nn.Module):
                     is true
         """
         if gen_targs: 
+            print("Generating Targets")
             with torch.no_grad():
                 output_ids, output_logits = self.model.causal_lm(
                     input_ids=data["input_ids"],
@@ -524,12 +536,6 @@ class LossWrapper(torch.nn.Module):
                     self.parameters(),
                     self.grad_clip
                 )
-        #print("grad shape:", self.model.embs.weight.grad.data.shape)
-        #print("grad mean:", self.model.embs.weight.grad.data.mean())
-        #print("grad max:", self.model.embs.weight.grad.data.max())
-        #print("grad min:", self.model.embs.weight.grad.data.min())
-        #print("grad norm:", self.model.embs.weight.grad.data.norm(2))
-        #print()
         argmax = torch.argmax(ps, dim=-1)
         acc = (argmax==labels).float().mean()
         ret_dict = { "loss": loss, "acc": acc, }
