@@ -115,14 +115,23 @@ def get_loaders(hyps, tokenizer, model=None, val_only=False):
         model.eval()
         hyps["n_data_procs"] = 1
     else: model = None
+
     path = os.path.join(hyps["data_root"],dset)
     if hyps["exp_name"]=="test": path = os.path.join(path,"debug")
-    if not os.path.exists(path): os.makedirs(path)
+    # Name data path with number of samples
     abbrev = hyps.get("abbrev_len", None)
-    if abbrev is None and os.path.exists(os.path.join(path,"train")):
-        train_path = os.path.join(path, "train")
-        print("Loading data from", train_path)
-        dataset = datasets.load_from_disk(train_path)
+    save_threshold = 100000
+    if abbrev is not None and abbrev>=save_threshold:
+        if abbrev>=1000000:
+            path = path + str(abbrev//1000000)+"m"
+        elif abbrev>=1000:
+            path = path + str(abbrev//1000)+"k"
+    if not os.path.exists(path): os.makedirs(path)
+
+    trpath = os.path.join(path,"train")
+    if (abbrev is None or abbrev>=100000) and os.path.exists(trpath):
+        print("Loading data from", trpath)
+        dataset = datasets.load_from_disk(trpath)
         val_path = os.path.join(path, "val")
         print("Loading data from", val_path)
         valset = datasets.load_from_disk(val_path)
@@ -195,9 +204,9 @@ def get_loaders(hyps, tokenizer, model=None, val_only=False):
             test_size = int(len(dataset)*.2)
             splt = dataset.train_test_split(test_size=test_size)
             dataset, valset = splt["train"], splt["test"]
-            if abbrev is None:
+            if abbrev is None or abbrev>=save_threshold:
                 dataset.save_to_disk(os.path.join(path, "train"))
-                valset.save_to_disk(os.path.join(path, "val"))
+                valset.save_to_disk( os.path.join(path, "val")  )
 
     dataset.set_format(type="torch")
     dataloader = torch.utils.data.DataLoader(
