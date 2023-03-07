@@ -167,18 +167,18 @@ if __name__=="__main__":
             avgs["high_loss"] += high_loss.item()
             avgs["high_acc"] +=  high_acc.item()
     for k,v in avgs.items():
-        avgs[k] = v/len(dataloader)
+        avgs[k] = round(v/len(dataloader), 4)
     print("TFrce Low Loss: {} -- Acc: {}".format(
-        round(avgs['tlow_loss'],dec), round(avgs['tlow_acc'],dec)
+        avgs['tlow_loss'], avgs['tlow_acc']
     ))
     print("Low Loss: {} -- Acc: {}".format(
-        round(avgs['low_loss'],dec), round(avgs['low_acc'],dec)
+        avgs['low_loss'], avgs['low_acc']
     ))
     print("TFrce High Loss: {} -- Acc: {}".format(
-        round(avgs['thigh_loss'],dec), round(avgs['thigh_acc'],dec)
+        avgs['thigh_loss'], avgs['thigh_acc']
     ))
     print("High Loss: {} -- Acc: {}".format(
-        round(avgs['high_loss'],dec), round(avgs['high_acc'],dec)
+        avgs['high_loss'], avgs['high_acc']
     ))
 
     for k,v in avgs.items():
