@@ -176,7 +176,7 @@ def get_loaders(hyps, tokenizer, model=None, val_only=False):
             num_proc=try_key(hyps,"n_data_procs",4)
         )
         dataset = dataset.shuffle()
-        abrv = try_key(hyps,"abbrev_len", 300)
+        abrv = hyps.get("abbrev_len", 300)
         if hyps["exp_name"]=="test" or (abrv is not None and abrv>0):
             if abrv is None: abrv = 600
             dataset = dataset[:abrv]

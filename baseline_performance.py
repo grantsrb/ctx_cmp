@@ -33,9 +33,11 @@ hyps = {
 
     "batch_size": 50,
 
-    "cmp_len": 15,
+    "cmp_len": 10,
     "seq_len": 20,
     "seq_overlap": 0,
+
+    "n_grad_loops": 1,
 }
 
 def get_metrics(hyps, model, inpts, loss_fxn, seed_len=3, tforce=True):
@@ -75,12 +77,12 @@ if __name__=="__main__":
         hyps = ml_utils.save_io.load_json(sys.argv[1])
         hyps["results_file"] = "./baseline_results.csv"
         hyps["abbrev_len"] = 1000
-        print(hyps)
     rank = 0
     verbose = True
     hyps["seed"] = hyps.get("seed", int(time.time()))
     if hyps["seed"] is None: hyps["seed"] = int(time.time())
     torch.manual_seed(hyps["seed"])
+    hyps["loss_scale"] = 1./hyps["n_grad_loops"]
 
     hyps["device_map"] = "auto" if hyps["model_parallel"] else None
     model = SentenceAutoEncoder(**hyps)
@@ -133,15 +135,15 @@ if __name__=="__main__":
               hyps, model, low_inpts, loss_fxn,
               tforce=True, seed_len=0
             )
-            avgs["tlow_loss"] += tlow_loss.item()
+            avgs["tlow_loss"] += tlow_loss.item()*hyps["loss_scale"]
             avgs["tlow_acc"] += tlow_acc.item()
 
             model.eval()
             low_loss, low_acc = get_metrics(
                 hyps, model, low_inpts, loss_fxn,
-                tforce=False, seed_len=max(hyps.get("seq_overlap",3),3)
+                tforce=False, seed_len=max(hyps.get("seq_overlap",1),1)
             )
-            avgs["low_loss"] += low_loss.item()
+            avgs["low_loss"] += low_loss.item()*hyps["loss_scale"]
             avgs["low_acc"] +=  low_acc.item()
 
             high_inpts = {
@@ -156,7 +158,7 @@ if __name__=="__main__":
             thigh_loss, thigh_acc = get_metrics(
               hyps, model, high_inpts, loss_fxn, tforce=True, seed_len=0
             )
-            avgs["thigh_loss"] += thigh_loss.item()
+            avgs["thigh_loss"] += thigh_loss.item()*hyps["loss_scale"]
             avgs["thigh_acc"] += thigh_acc.item()
 
             model.eval()
@@ -164,7 +166,7 @@ if __name__=="__main__":
                 hyps, model, high_inpts, loss_fxn, tforce=False,
                 seed_len=data["input_ids"].shape[1]
             )
-            avgs["high_loss"] += high_loss.item()
+            avgs["high_loss"] += high_loss.item()*hyps["loss_scale"]
             avgs["high_acc"] +=  high_acc.item()
     for k,v in avgs.items():
         avgs[k] = round(v/len(dataloader), 4)
