@@ -97,12 +97,14 @@ def owt_causal_encode(examples, tokenizer, cmp_len=20, seq_len=100,
 
     return {**cmps, **seqs}
 
-def get_loaders(hyps, tokenizer, model=None):
+def get_loaders(hyps, tokenizer, model=None, val_only=False):
     """
     Use this function to get the training and validation loaders.
 
     Args:
         model: SentenceAutoEncoder
+        val_only: bool
+            if true, only returns test split
     """
     hyps["data_root"] = try_key(
         hyps,"data_root",hyps["save_root"]+"datasplits"
@@ -140,19 +142,17 @@ def get_loaders(hyps, tokenizer, model=None):
             remove_columns=["sentence1", "sentence2", "idx", "label"]
         )
         dataset.set_format(type="torch")
-        dataloader = torch.utils.data.DataLoader(
-            dataset, batch_size=hyps["batch_size"], shuffle=True
-        )
-        valset = datasets.load_dataset(
-            "glue", "mrpc", split="validation",
-            cache_dir=try_key(hyps,"data_cache",None)
-        )
-        valset = valset.map(encode_fxn, batched=True)
-        valset = valset.remove_columns(
-            ["sentence1", "sentence2", "idx", "label"]
-        )
         dataset.save_to_disk(os.path.join(path, "train"))
-        valset.save_to_disk(os.path.join(path, "val"))
+        if not val_only:
+            valset = datasets.load_dataset(
+                "glue", "mrpc", split="validation",
+                cache_dir=try_key(hyps,"data_cache",None)
+            )
+            valset = valset.map(encode_fxn, batched=True)
+            valset = valset.remove_columns(
+                ["sentence1", "sentence2", "idx", "label"]
+            )
+            valset.save_to_disk(os.path.join(path, "val"))
     elif hyps["dataset"]=="openwebtext":
         if try_key(hyps,"rmb_only",False):
             print("RMB Only")
@@ -191,23 +191,26 @@ def get_loaders(hyps, tokenizer, model=None):
             remove_columns=["text"],
             batch_size=bsize
         )
-        test_size = int(len(dataset)*.2)
-        splt = dataset.train_test_split(test_size=test_size)
-        dataset, valset = splt["train"], splt["test"]
-        if abbrev is None:
-            dataset.save_to_disk(os.path.join(path, "train"))
-            valset.save_to_disk(os.path.join(path, "val"))
+        if not val_only:
+            test_size = int(len(dataset)*.2)
+            splt = dataset.train_test_split(test_size=test_size)
+            dataset, valset = splt["train"], splt["test"]
+            if abbrev is None:
+                dataset.save_to_disk(os.path.join(path, "train"))
+                valset.save_to_disk(os.path.join(path, "val"))
 
     dataset.set_format(type="torch")
     dataloader = torch.utils.data.DataLoader(
         dataset, batch_size=hyps["batch_size"], shuffle=True
     )
-    valset.set_format(type="torch")
-    vsize = try_key(hyps, "val_batch_size", hyps["batch_size"])
-    valloader = torch.utils.data.DataLoader(
-        valset, batch_size=vsize, shuffle=True
-    )
-    return dataset, valset, dataloader, valloader
+    if not val_only:
+        valset.set_format(type="torch")
+        vsize = try_key(hyps, "val_batch_size", hyps["batch_size"])
+        valloader = torch.utils.data.DataLoader(
+            valset, batch_size=vsize, shuffle=True
+        )
+        return dataset, valset, dataloader, valloader
+    return dataset, dataloader
 
 def glue_encode(examples, tokenizer, max_seq_len=100):
     tokenizer.padding_side = "left"
