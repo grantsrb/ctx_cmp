@@ -110,7 +110,7 @@ def get_loaders(hyps, tokenizer, model=None, val_only=False):
         hyps,"data_root",hyps["save_root"]+"datasplits"
     )
     dset = hyps["dataset"]
-    if hyps["gen_targs"]:
+    if hyps.get("gen_targs", False):
         dset += "modelgen"
         model.eval()
         hyps["n_data_procs"] = 1
@@ -118,7 +118,7 @@ def get_loaders(hyps, tokenizer, model=None, val_only=False):
     path = os.path.join(hyps["data_root"],dset)
     if hyps["exp_name"]=="test": path = os.path.join(path,"debug")
     if not os.path.exists(path): os.makedirs(path)
-    abbrev = try_key(hyps, "abbrev_len", None)
+    abbrev = hyps.get("abbrev_len", None)
     if abbrev is None and os.path.exists(os.path.join(path,"train")):
         train_path = os.path.join(path, "train")
         print("Loading data from", train_path)

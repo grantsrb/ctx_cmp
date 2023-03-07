@@ -334,7 +334,7 @@ class SentenceAutoEncoder(torch.nn.Module):
             tforce: bool
                 determines whether model should use teacher forcing for
                 predictions or not.
-            seed_len: int or None
+            seed_len: int or None, must be greater than 0 if not None
                 the number of inputs to seed the non-teacher forced
                 predictions. Only applies if tforce is false. If None
                 is argued, uses the whole input_ids or inputs_embeds
@@ -371,10 +371,16 @@ class SentenceAutoEncoder(torch.nn.Module):
         t_embs = self.hf_model.transformer.get_input_embeddings()
         if input_ids is not None:
             if seed_len is None: seed_len = input_ids.shape[1]
+            elif seed_len == 0:
+                seed_len = 1
+                if pred_len is not None: pred_len -= 1
             input_ids = input_ids[:,:seed_len]
             inputs_embeds = t_embs(input_ids)
         else:
             if seed_len is None: seed_len = inputs_embeds.shape[1]
+            elif seed_len == 0:
+                seed_len = 1
+                if pred_len is not None: pred_len -= 1
             inputs_embeds = inputs_embeds[:,:seed_len]
             input_ids = torch.zeros_like(inputs_embeds[:,:,0])
         if self.train_embs: inputs_embeds = inputs_embeds.data
