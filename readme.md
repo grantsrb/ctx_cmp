@@ -46,18 +46,21 @@ then running the following command:
         the floating point precision to use. for example: "float32"
     "seed": int
         the random seed for all stochastic processes
+
     "dataset": str
         a string of the huggingface datasets dataset you would like to
         use. Currently only support "openwebtext" and "glue"
+    "n_data_procs": int
+        the number of parallel processes to use for the initial
+        encoding of the data.
+
     "gen_targs": bool
         if true, the model will generate the target tokens
     "gen_ids": bool
         if true, the model will use the generated ids rather than
         the logits as the ground truth. only applies if `gen_targs` is
         true
-    "n_data_procs": int
-        the number of parallel processes to use for the initial
-        encoding of the data.
+
     "max_val_loops": int
         enforces a limit on the number of validation iterations. This
         is useful for speeding up trainings
@@ -67,6 +70,18 @@ then running the following command:
     "checkpt_mod": int or None
         during training, the model will be saved every `checkpt_mod`
         iterations
+
+    "rmb_task": bool
+        includes rememberance task (i.e. autoencoder task) if true.
+        otherwise, only calculates forward prediction from cmpr context
+    "rmb_only": bool
+        if true, uses rmb task only instead of forward prediction task
+    "csl_task": bool
+        if true, includes the traditional causal language modeling on
+        the whole context (cmpr context + forward context) without
+        using the context compression. This loss is in addition to the
+        cmpr and rmb losses. Must set `train_lmhead` and or `train_embs`
+        to true for this task to have any effect.
 
     "train_lmhead": bool
         if true, the final output layer is trainable

@@ -1,7 +1,6 @@
 import torch
 from transformers import AutoModelForCausalLM
 import numpy as np
-from ml_utils.utils import try_key
 
 
 class SentenceAutoEncoder(torch.nn.Module):
@@ -363,6 +362,7 @@ class SentenceAutoEncoder(torch.nn.Module):
                 attention_mask=attention_mask,
                 inputs_embeds=inputs_embeds,
             ).logits
+            logits = logits[:,:-1]
             preds = logits.argmax(-1)
             if ret_logits:
                 return preds, logits
@@ -416,7 +416,7 @@ class LossWrapper(torch.nn.Module):
     on all GPUs. Otherwise one gpu is overloaded with computational
     costs.
     """
-    def __init__(self, model, tokenizer, hyps, loss_scale=1.):
+    def __init__(self, model, tokenizer, hyps, *args, **kwargs):
         """
         loss_scale: float
             the loss is multiplied by this value on every iteration.
@@ -427,10 +427,11 @@ class LossWrapper(torch.nn.Module):
         super().__init__()
         self.model = model
         self.tokenizer = tokenizer
-        self.loss_scale = loss_scale
+        self.loss_scale = 1./hyps.get("n_grad_loops",1)
+        self.csl_scale = hyps.get("csl_scale",1.)
         self.loss_fxn = torch.nn.CrossEntropyLoss()
         self.hyps = hyps
-        self.grad_clip = try_key(self.hyps, "grad_clip", 10)
+        self.grad_clip = self.hyps.get("grad_clip", 10)
 
     def forward(self, data, ret_preds=False, seq_len=30,
                                              tforce=True,
@@ -502,42 +503,33 @@ class LossWrapper(torch.nn.Module):
         if self.hyps["rmb_task"]:
             preds, rmb_preds = self.model(data, tforce=tforce)
             # Need to remove CMP representation, the first n elements
-            ps = rmb_preds.reshape(-1,rmb_preds.shape[-1])
-            labels = data["input_ids"].reshape(-1)
-            #idx = (labels!=self.tokenizer.pad_token_id)
-            idx = data["attention_mask"].bool().reshape(-1)
-            rmb_loss = self.loss_fxn(ps[idx],labels[idx])*self.loss_scale
-            argmax = torch.argmax(ps[idx], dim=-1)
-            rmb_acc = (argmax==labels[idx]).float().mean()
+            rmb_loss, rmb_acc = loss_and_acc(
+                preds=rmb_preds, labels=data["input_ids"],
+                attn=data["attention_mask"], loss_fxn=self.loss_fxn,
+                loss_scale=self.loss_scale
+            )
         else:
             preds = self.model(data, tforce=tforce)
 
-        # Need to remove CMP representation, the first n elements
-        ps = preds.reshape(-1, preds.shape[-1])
         if gen_ids or "output_logits" not in data:
-            labels = data["output_ids"].reshape(-1)
-            idx = data["output_attn_mask"].bool().reshape(-1)
-            #idx = labels!=self.tokenizer.pad_token_id
-            ps = ps[idx]
-            labels = labels[idx]
-            loss = self.loss_fxn(ps, labels)*self.loss_scale
+            loss, acc = loss_and_acc(
+                preds, data["output_ids"], attn=data["output_attn_mask"],
+                loss_fxn=self.loss_fxn, loss_scale=self.loss_scale
+            )
         else:
-            output_logits = data["output_logits"]
-            labels = output_logits.reshape(-1, output_logits.shape[-1])
-            loss = self.loss_fxn(ps, labels)*self.loss_scale
+            ps = preds.reshape(-1, preds.shape[-1])
             labels = data["output_ids"].reshape(-1)
+            target = data["output_logits"]
+            target = target.reshape(-1, output_logits.shape[-1])
+            loss = self.loss_fxn(ps, target)*self.loss_scale
+            argmax = torch.argmax(ps, dim=-1)
+            acc = (argmax==labels).float().mean()
 
         sum_loss = loss
         if self.training:
             if self.hyps["rmb_task"]: sum_loss += rmb_loss
             sum_loss.backward()
-            if self.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    self.parameters(),
-                    self.grad_clip
-                )
-        argmax = torch.argmax(ps, dim=-1)
-        acc = (argmax==labels).float().mean()
+
         ret_dict = { "loss": loss, "acc": acc, }
         if self.hyps["rmb_task"]:
             ret_dict["rmb_loss"] = rmb_loss
@@ -546,6 +538,57 @@ class LossWrapper(torch.nn.Module):
                 ret_dict["rmb_preds"] = rmb_preds
         if ret_preds:
             ret_dict["preds"] = preds
+
+        # Do causal lm task after everything else to save space on
+        # gpu.
+        if self.hyps.get("csl_task",False):
+            # Create complete sequence
+            causal_inpts = {
+              "input_ids": torch.cat([
+                data["input_ids"],data["output_ids"]
+              ], dim=1),
+              "attention_mask": torch.cat([ 
+                data["attention_mask"], data["output_attn_mask"]
+              ], dim=1)
+            }
+            # Make predictions
+            _, preds = self.model.causal_lm(
+              **causal_inpts, tforce=True, ret_logits=True, seed_len=0
+            )
+            # Calculate loss
+            loss, acc = loss_and_acc(
+                preds, causal_inpts["input_ids"][:,1:],
+                attn=causal_inpts["attention_mask"][:,1:],
+                loss_fxn=self.loss_fxn,
+                loss_scale=self.loss_scale
+            )
+            loss = loss*self.csl_scale
+            # Backpropagate error
+            if self.training:
+                loss.backward()
+            ret_dict["csl_loss"] = loss
+            ret_dict["csl_acc"] = acc
+            if ret_preds:
+                ret_dict["csl_preds"] = preds
         return ret_dict
 
-
+def loss_and_acc(preds, labels, attn, loss_fxn, loss_scale=1):
+    """
+    preds: torch float tensor (B,S,L)
+        prediction logits
+    labels: torch long tensor (B,S)
+        prediction ids
+    attn: torch tensor (B,S)
+        padding mask. 1s mean include these tokens, 0 means ignore them
+    loss_fxn: function
+        the loss function for the predictions
+    loss_scale: float
+        a scalar that scales the loss
+    """
+    ps = preds.reshape(-1,preds.shape[-1])
+    labels = labels.reshape(-1)
+    idx = attn.bool().reshape(-1)
+    loss = loss_fxn(ps[idx],labels[idx])*loss_scale
+    argmax = torch.argmax(ps[idx], dim=-1)
+    acc = (argmax==labels[idx]).float().mean()
+    return loss, acc

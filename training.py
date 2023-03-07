@@ -25,6 +25,8 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
     if hyps["multi_gpu"]:
         world_size = try_key(hyps, "n_gpus", 1)
         dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    assert not hyps.get("csl_task",False) or\
+        (hyps.get("train_lmhead",False) or hyps.get("train_embs", False))
 
     # Hyperparameters
     if hyps["exp_name"]=="test" and hyps["test_model_str"] is not None:
@@ -93,8 +95,7 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
     wrapped_model = LossWrapper(
         ddp_model,
         tokenizer,
-        hyps=hyps,
-        loss_scale=1/hyps["n_grad_loops"]
+        hyps=hyps
     )
     if not hyps["model_parallel"]:
         if verbose and rank==0:
@@ -139,7 +140,7 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
         torch.cuda.empty_cache()
         if rank==0 and verbose:
             print()
-            s = "Beginning Epoch {} -- {}".format(
+            s = "Beginning Epoch {} - {}".format(
                 epoch, hyps["save_folder"]
             )
             print(s)
@@ -149,6 +150,8 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
         avg_acc = 0
         rmb_avg_loss = 0
         rmb_avg_acc = 0
+        csl_avg_loss = 0
+        csl_avg_acc = 0
         nloops = try_key(hyps,"n_train_loops", None)
         nloops = len(dataloader) if nloops is None else nloops
         nloops = min(nloops,len(dataloader))
@@ -175,6 +178,9 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
             if "rmb_loss" in package:
                 rmb_avg_loss += package["rmb_loss"].item()
                 rmb_avg_acc  += package["rmb_acc"].item()
+            if "csl_loss" in package:
+                csl_avg_loss += package["csl_loss"].item()
+                csl_avg_acc  += package["csl_acc"].item()
 
             if i%hyps["n_grad_loops"]==0 or i==len(dataloader)-1:
                 if try_key(hyps,"grad_scaling",False):
@@ -183,22 +189,31 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
                 #print("abs grad mean:",  temp.abs().mean(-1))
                 #print("grad norm:",      temp.norm(2))
                 #print()
+                if hyps.get("grad_clip",0) > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        wrapped_model.parameters(), hyps["grad_clip"]
+                    )
                 optimizer.step()
                 optimizer.zero_grad()
 
             if verbose and i%10==0 and rank==0:
-                l = round(loss.item(), 5)
-                a = round(acc.item(), 5)
+                dec = 4
+                l = round(loss.item(), dec)
+                a = round(acc.item(), dec)
                 c = round(100*i/nloops, 2)
                 t = round(time.time()-starttime, 3)
-                s = "Loss:{} -- Acc:{}".format(l,a)
+                s = "Loss: {} -Acc: {}".format(l,a)
                 if "rmb_loss" in package:
-                    l = round(package["rmb_loss"].item(), 5)
-                    a = round(package["rmb_acc"].item(), 5)
-                    s += " -- RmbLoss:{} -- RmbAc:{}".format(l,a)
-                s += " -- {}% -- {}s   ".format(c,t)
+                    l = round(package["rmb_loss"].item(), dec)
+                    a = round(package["rmb_acc"].item(), dec)
+                    s += " -RMB: {} -RMBAc: {}".format(l,a)
+                if "csl_loss" in package:
+                    l = round(package["csl_loss"].item(), dec)
+                    a = round(package["csl_acc"].item(), dec)
+                    s += " -CSL: {} -CSLAc: {}".format(l,a)
+                s += " - {}% {}s   ".format(c,t)
                 #s = "Loss: {} -- Acc: {} -- {}% -- {}s".format(l,a,c,t)
-                print(s, end="  " + len(s)*" " + "\r")
+                print(s, end=int(len(s)/2)*" " + "\r")
             if hyps["exp_name"]=="test" and i>=30: break
             if i>=(nloops-1): break
             if i>0 and i%checkpt_mod==0 and rank==0:
@@ -209,10 +224,12 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
                         print(s)
                         low_preds, high_preds = get_baselines(
                             model,data,hyps,
-                            rank=rank,tforce=True,to_cpu=True
+                            rank=rank,tforce=True,to_cpu=True,
+                            calc_high="csl_preds" not in package
                         )
+                        high_preds=package.get("csl_preds",high_preds)
                         inpt_dict = {
-                            "input_ids": data["input_ids"],
+                            "input_ids":  data["input_ids"],
                             "output_ids": data["output_ids"],
                             **package,
                             "low": low_preds, "high": high_preds
@@ -253,14 +270,19 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
         if "rmb_loss" in package:
             rmb_train_loss = round(rmb_avg_loss/div, 5)
             rmb_train_acc = round(rmb_avg_acc/div, 5)
+        if "csl_loss" in package:
+            csl_train_loss = round(csl_avg_loss/div, 5)
+            csl_train_acc = round(csl_avg_acc/div, 5)
         if rank==0 and verbose:
             print()
             s = "Example Predictions On Training"
             print(s)
             logstr += s + "\n"
             low_preds, high_preds = get_baselines(
-                model,data,hyps,rank=rank,tforce=True,to_cpu=True
+                model,data,hyps, rank=rank,tforce=True,to_cpu=True,
+                calc_high="csl_preds" not in package
             )
+            high_preds=package.get("csl_preds",high_preds)
             inpt_dict = {
                 "input_ids":  data["input_ids"],
                 "output_ids": data["output_ids"],
@@ -280,6 +302,8 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
         avg_acc = 0
         rmb_avg_loss = 0
         rmb_avg_acc = 0
+        csl_avg_loss = 0
+        csl_avg_acc = 0
         if rank==0 and epoch%val_mod==0:
             wrapped_model.eval()
             if verbose:
@@ -304,6 +328,9 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
                     if "rmb_loss" in package:
                         rmb_avg_loss += package["rmb_loss"].item()
                         rmb_avg_acc  += package["rmb_acc"].item()
+                    if "csl_loss" in package:
+                        csl_avg_loss += package["csl_loss"].item()
+                        csl_avg_acc  += package["csl_acc"].item()
 
                     avg_loss += loss.item()
                     avg_acc += acc.item()
@@ -319,14 +346,19 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
             if "rmb_loss" in package:
                 rmb_val_loss = round(rmb_avg_loss/div, 5)
                 rmb_val_acc = round(rmb_avg_acc/div, 5)
+            if "csl_loss" in package:
+                csl_val_loss = round(csl_avg_loss/div, 5)
+                csl_val_acc = round(csl_avg_acc/div, 5)
             if rank==0 and verbose:
                 print()
                 s = "Example Predictions On Validation"
                 print(s)
                 logstr += s + "\n"
                 low_preds, high_preds = get_baselines(
-                    model,data,hyps,rank=rank,tforce=False,to_cpu=True
+                    model,data,hyps,rank=rank,tforce=False,to_cpu=True,
+                    calc_high="csl_preds" not in package
                 )
+                high_preds=package.get("csl_preds",high_preds)
                 inpt_dict = {
                     "input_ids": data["input_ids"],
                     "output_ids": data["output_ids"],
@@ -344,24 +376,35 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
                 print(s)
                 logstr += "\n" + s + "\n"
 
-                s = "Train Loss: {} -- Train Acc: {}".format(
+                s = "Train Loss: {} -Train Acc: {}".format(
                     train_loss,train_acc
                 )
                 print(s)
                 logstr += s + "\n"
-                s = "Val Loss: {} -- Val Acc: {}".format(
+                s = "Val Loss: {} -Val Acc: {}".format(
                     val_loss,val_acc
                 )
                 print(s)
                 logstr += s + "\n"
                 if "rmb_loss" in package:
-                    s = "RMB Train Loss: {} -- RMB Train Acc: {}".format(
+                    s = "RMB Train Loss: {} -RMB Train Acc: {}".format(
                         rmb_train_loss, rmb_train_acc
                     )
                     print(s)
                     logstr += s + "\n"
-                    s = "RMB Val Loss: {} -- RMB Val Acc: {}".format(
+                    s = "RMB Val Loss: {} -RMB Val Acc: {}".format(
                         rmb_val_loss, rmb_val_acc
+                    )
+                    print(s)
+                    logstr += s + "\n"
+                if "csl_loss" in package:
+                    s = "CSL Train Loss: {} -CSL Train Acc: {}".format(
+                        csl_train_loss, csl_train_acc
+                    )
+                    print(s)
+                    logstr += s + "\n"
+                    s = "CSL Val Loss: {} -CSL Val Acc: {}".format(
+                        csl_val_loss, csl_val_acc
                     )
                     print(s)
                     logstr += s + "\n"
@@ -392,6 +435,11 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
                     save_dict["rmb_train_acc"] =  rmb_train_acc
                     save_dict["rmb_val_loss"] =   rmb_val_loss
                     save_dict["rmb_val_acc"] =    rmb_val_acc
+                if "csl_loss" in package:
+                    save_dict["csl_train_loss"] = csl_train_loss
+                    save_dict["csl_train_acc"] =  csl_train_acc
+                    save_dict["csl_val_loss"] =   csl_val_loss
+                    save_dict["csl_val_acc"] =    csl_val_acc
                 ml_utils.save_io.save_checkpt(
                     save_dict=save_dict,
                     save_folder=hyps["save_folder"],
@@ -445,11 +493,11 @@ def print_examples(inpt_dict, tokenizer, n_samps=5):
         tensors.append(rmbs)
     targs = inpt_dict["output_ids"]
     tensors.append(targs)
-    preds = {
-        "low":  inpt_dict["low"],
-        "pred": inpt_dict["preds"].argmax(-1),
-        "high": inpt_dict["high"],
-    }
+    preds = dict()
+    for k in ["low", "preds", "high"]:
+        if len(inpt_dict[k].shape)==3:
+            preds[k] = inpt_dict[k].argmax(-1)
+        else: preds[k] = inpt_dict[k]
     tensors = tensors + [v for v in preds.values()]
 
     lens = []
@@ -497,17 +545,32 @@ def print_examples(inpt_dict, tokenizer, n_samps=5):
         examples.append(examp)
     return examples, logstr
 
-def get_baselines(model, data, hyps, rank=0, tforce=True, to_cpu=True):
+def get_baselines(model, data, hyps, rank=0, tforce=True,
+                                             to_cpu=True,
+                                             calc_high=True):
     """
-    model: SentenceAutoEncoder
-    data: dict {str: tensor}
-        input_ids: tensor
-        attention_mask: tensor
-    hyps: dict
-    rank: int
-    tforce: bool
-    to_cpu: bool
-        if true, returns tensors on cpu
+    Args:
+        model: SentenceAutoEncoder
+        data: dict {str: tensor}
+            input_ids: tensor
+            attention_mask: tensor
+        hyps: dict
+        rank: int
+        tforce: bool
+        to_cpu: bool
+            if true, returns tensors on cpu
+        calc_high: bool
+            if true, calculates the high preds. otherwise returns None
+            for high_preds
+
+    Returns:
+        low_preds: torch tensor (B,S,L)
+            logits predicted with minimal token seed (i.e. almost no
+            token context from cmp sequence)
+        high_preds: torch tensor (B,S,L)
+            logits predicted with maximal token seed (i.e. complete
+            token context from cmp sequence)
+            returns tensor of zeros if calc_high is false
     """
     with torch.no_grad():
         low_inpts = {
@@ -521,26 +584,26 @@ def get_baselines(model, data, hyps, rank=0, tforce=True, to_cpu=True):
             seed_len=max(3,hyps["seq_overlap"])
         )
 
-        high_inpts = {
-            "input_ids": torch.cat(
-              [ data["input_ids"].to(rank), data["output_ids"].to(rank) ],
-              dim=1
-            ),
-            "attention_mask": torch.cat(
-              [ 
-                data["attention_mask"].to(rank),
-                data["output_attn_mask"].to(rank)
-              ],
-              dim=1
-            )
-        }
-        high_preds = model.causal_lm(
-            **high_inpts,
-            tforce=tforce,
-            ret_logits=False,
+        if calc_high:
+            high_inpts = {
+                "input_ids": torch.cat([
+                    data["input_ids"].to(rank),
+                    data["output_ids"].to(rank)
+                ], dim=1),
+                "attention_mask": torch.cat([
+                    data["attention_mask"].to(rank),
+                    data["output_attn_mask"].to(rank)
+                ], dim=1)
+            }
             seed_len=data["input_ids"].shape[1]+max(0,hyps["seq_overlap"])
-        )
-        high_preds = high_preds[:,data["input_ids"].shape[1]:]
+            high_preds = model.causal_lm(
+                **high_inpts,
+                tforce=tforce,
+                ret_logits=False,
+                seed_len=seed_len
+            )
+            high_preds = high_preds[:,data["input_ids"].shape[1]:]
+        else: high_preds = torch.zeros(1,1,1)
     if to_cpu:
         low_preds = low_preds.cpu()
         high_preds = high_preds.cpu()
