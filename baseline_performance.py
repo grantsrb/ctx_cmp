@@ -105,11 +105,14 @@ if __name__=="__main__":
     # Make dataset
     if verbose and rank==0:
         print("Collecting Data")
-    dataset, dataloader = datas.get_loaders(
+    dataset, valset, dataloader, valloader = datas.get_loaders(
         hyps,
         tokenizer,
-        val_only=True
     )
+    abrv = hyps.get("abbrev_len", None)
+    if abrv is not None and abrv<100000:
+        valset = dataset
+        valloader = dataloader
 
 
     loss_fxn = torch.nn.CrossEntropyLoss()
@@ -138,13 +141,14 @@ if __name__=="__main__":
             avgs["tlow_loss"] += tlow_loss.item()*hyps["loss_scale"]
             avgs["tlow_acc"] += tlow_acc.item()
 
-            model.eval()
-            low_loss, low_acc = get_metrics(
-                hyps, model, low_inpts, loss_fxn,
-                tforce=False, seed_len=max(hyps.get("seq_overlap",1),1)
-            )
-            avgs["low_loss"] += low_loss.item()*hyps["loss_scale"]
-            avgs["low_acc"] +=  low_acc.item()
+            if valloader==dataloader:
+                model.eval()
+                low_loss, low_acc = get_metrics(
+                  hyps, model, low_inpts, loss_fxn,
+                  tforce=False, seed_len=max(hyps.get("seq_overlap",1),1)
+                )
+                avgs["low_loss"] += low_loss.item()*hyps["loss_scale"]
+                avgs["low_acc"] +=  low_acc.item()
 
             high_inpts = {
               "input_ids": torch.cat([
@@ -161,27 +165,73 @@ if __name__=="__main__":
             avgs["thigh_loss"] += thigh_loss.item()*hyps["loss_scale"]
             avgs["thigh_acc"] += thigh_acc.item()
 
-            model.eval()
-            high_loss, high_acc = get_metrics(
-                hyps, model, high_inpts, loss_fxn, tforce=False,
-                seed_len=data["input_ids"].shape[1]
-            )
-            avgs["high_loss"] += high_loss.item()*hyps["loss_scale"]
-            avgs["high_acc"] +=  high_acc.item()
+            if valloader==dataloader:
+                model.eval()
+                high_loss, high_acc = get_metrics(
+                    hyps, model, high_inpts, loss_fxn, tforce=False,
+                    seed_len=data["input_ids"].shape[1]
+                )
+                avgs["high_loss"] += high_loss.item()*hyps["loss_scale"]
+                avgs["high_acc"] +=  high_acc.item()
+        if (i+1) > hyps.get("n_train_loops", np.inf): break
     for k,v in avgs.items():
-        avgs[k] = round(v/len(dataloader), 4)
+        avgs[k] = round(v/(i+1), 4)
     print("TFrce Low Loss: {} -- Acc: {}".format(
         avgs['tlow_loss'], avgs['tlow_acc']
     ))
-    print("Low Loss: {} -- Acc: {}".format(
-        avgs['low_loss'], avgs['low_acc']
-    ))
+    if valloader==dataloader:
+        print("Low Loss: {} -- Acc: {}".format(
+            avgs['low_loss'], avgs['low_acc']
+        ))
     print("TFrce High Loss: {} -- Acc: {}".format(
         avgs['thigh_loss'], avgs['thigh_acc']
     ))
-    print("High Loss: {} -- Acc: {}".format(
-        avgs['high_loss'], avgs['high_acc']
-    ))
+    if valloader==dataloader:
+        print("High Loss: {} -- Acc: {}".format(
+            avgs['high_loss'], avgs['high_acc']
+        ))
+
+    if valloader!=dataloader:
+        for i,data in tqdm(enumerate(valloader)):
+            data = {k: v.to(rank) for k,v in data.items()}
+            with torch.no_grad():
+                low_inpts = {
+                    "input_ids": data["output_ids"],
+                    "attention_mask": data["output_attn_mask"],
+                }
+                model.eval()
+                low_loss, low_acc = get_metrics(
+                  hyps, model, low_inpts, loss_fxn,
+                  tforce=False, seed_len=max(hyps.get("seq_overlap",1),1)
+                )
+                avgs["low_loss"] += low_loss.item()*hyps["loss_scale"]
+                avgs["low_acc"] +=  low_acc.item()
+
+                high_inpts = {
+                  "input_ids": torch.cat([
+                    data["input_ids"],data["output_ids"]
+                  ], dim=1),
+                  "attention_mask": torch.cat([ 
+                    data["attention_mask"], data["output_attn_mask"]
+                  ], dim=1)
+                }
+                model.eval()
+                high_loss, high_acc = get_metrics(
+                    hyps, model, high_inpts, loss_fxn, tforce=False,
+                    seed_len=data["input_ids"].shape[1]
+                )
+                avgs["high_loss"] += high_loss.item()*hyps["loss_scale"]
+                avgs["high_acc"] +=  high_acc.item()
+            if (i+1) > hyps.get("max_val_loops", np.inf): break
+        for k,v in avgs.items():
+            if "t"!=k[0]:
+                avgs[k] = round(v/(i+1), 4)
+        print("Low Loss: {} -- Acc: {}".format(
+            avgs['low_loss'], avgs['low_acc']
+        ))
+        print("High Loss: {} -- Acc: {}".format(
+            avgs['high_loss'], avgs['high_acc']
+        ))
 
     for k,v in avgs.items():
         avgs[k] = [v]
@@ -190,5 +240,5 @@ if __name__=="__main__":
         try:
             df[k] = v
         except: print("error for", k)
-    df.to_csv(hyps["results_file"], mode="a")
+    df.to_csv(hyps["results_file"], mode="a", index=False)
 
