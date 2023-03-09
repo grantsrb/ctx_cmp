@@ -74,7 +74,8 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
     if hyps["multi_gpu"]: model = ddp_model.model
     else: model = ddp_model
     model.add_embeddings(num_added)
-    model.to(rank)
+    if not hyps["model_parallel"]:
+        model.to(rank)
 
     # Make dataset
     if verbose and rank==0:
@@ -161,7 +162,13 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
         optimizer.zero_grad()
         for i,data in enumerate(dataloader):
             starttime = time.time()
-            data = {k: v.to(rank) for k,v in data.items()}
+            if not hyps["model_parallel"]:
+                data = {k: v.to(rank) for k,v in data.items()}
+            #if hyps["dtype"]!="float32":
+            #  data = {
+            #    k: v.to(getattr(torch,hyps["dtype"])) for\
+            #                           k,v in data.items()
+            #  }
 
             package = wrapped_model(
                 data,
@@ -313,7 +320,13 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
                 if nloops is None: nloops = len(valloader)
                 for i,data in enumerate(valloader):
                     starttime = time.time()
-                    data = {k: v.to(rank) for k,v in data.items()}
+                    if not hyps["model_parallel"]:
+                        data = {k: v.to(rank) for k,v in data.items()}
+                    #if hyps["dtype"]!="float32":
+                    #  data = {
+                    #    k: v.to(getattr(torch,hyps["dtype"])) for\
+                    #                          k,v in data.items()
+                    #  }
                     package = wrapped_model(
                         data,
                         ret_preds=True,
@@ -574,9 +587,11 @@ def get_baselines(model, data, hyps, rank=0, tforce=True,
     """
     with torch.no_grad():
         low_inpts = {
-            "input_ids": data["output_ids"].to(rank),
-            "attention_mask": data["output_attn_mask"].to(rank),
+            "input_ids": data["output_ids"],
+            "attention_mask": data["output_attn_mask"],
         }
+        if not hyps["model_parallel"]:
+            low_inpts = {k: v.to(rank) for k,v in low_inpts.items()}
         low_preds =  model.causal_lm(
             **low_inpts,
             tforce=tforce,
@@ -587,14 +602,14 @@ def get_baselines(model, data, hyps, rank=0, tforce=True,
         if calc_high:
             high_inpts = {
                 "input_ids": torch.cat([
-                    data["input_ids"].to(rank),
-                    data["output_ids"].to(rank)
+                    data["input_ids"], data["output_ids"]
                 ], dim=1),
                 "attention_mask": torch.cat([
-                    data["attention_mask"].to(rank),
-                    data["output_attn_mask"].to(rank)
+                    data["attention_mask"], data["output_attn_mask"]
                 ], dim=1)
             }
+            if not hyps["model_parallel"]:
+                high_inpts = {k: v.to(rank) for k,v in high_inpts.items()}
             seed_len=data["input_ids"].shape[1]+max(0,hyps["seq_overlap"])
             high_preds = model.causal_lm(
                 **high_inpts,
