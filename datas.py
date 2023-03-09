@@ -163,6 +163,7 @@ def get_loaders(hyps, tokenizer, model=None, val_only=False):
             )
             valset.save_to_disk(os.path.join(path, "val"))
     elif hyps["dataset"]=="openwebtext":
+        print("Failed to find", trpath, "Manually loading dataset")
         if try_key(hyps,"rmb_only",False):
             print("RMB Only")
             encode_fxn = lambda x: owt_autoencode(

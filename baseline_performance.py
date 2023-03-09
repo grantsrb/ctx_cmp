@@ -76,7 +76,8 @@ if __name__=="__main__":
     if len(sys.argv)>1:
         hyps = ml_utils.save_io.load_json(sys.argv[1])
         hyps["results_file"] = "./baseline_results.csv"
-        hyps["abbrev_len"] = 1000
+        if hyps["abbrev_len"] is None: 
+            hyps["abbrev_len"] = 1000
     rank = 0
     verbose = True
     hyps["seed"] = hyps.get("seed", int(time.time()))
@@ -104,7 +105,7 @@ if __name__=="__main__":
 
     # Make dataset
     if verbose and rank==0:
-        print("Collecting Data")
+        print("Collecting Data", hyps["dataset"], hyps["abbrev_len"])
     dataset, valset, dataloader, valloader = datas.get_loaders(
         hyps,
         tokenizer,
@@ -192,6 +193,7 @@ if __name__=="__main__":
         ))
 
     if valloader!=dataloader:
+        print("Using Separate Validation Loader")
         for i,data in tqdm(enumerate(valloader)):
             data = {k: v.to(rank) for k,v in data.items()}
             with torch.no_grad():
@@ -240,5 +242,8 @@ if __name__=="__main__":
         try:
             df[k] = v
         except: print("error for", k)
-    df.to_csv(hyps["results_file"], mode="a", index=False)
+    if os.path.exists(hyps["results_file"]):
+        og_df = pd.read_csv(hyps["results_file"])
+        df = og_df.append(df, sort=True)
+    df.to_csv(hyps["results_file"], mode="w", index=False, header=True)
 
