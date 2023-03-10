@@ -8,7 +8,7 @@ class SentenceAutoEncoder(torch.nn.Module):
     Trains a new token type to compress a sentence into a single vector
     representation
     """
-    def __init__(self, model_string, rank=0, torch_dtype="float32",
+    def __init__(self, model_string, rank=0, dtype="float32",
                                              device_map="auto",
                                              cmp_layer="half",
                                              rmb_task=False,
@@ -22,7 +22,7 @@ class SentenceAutoEncoder(torch.nn.Module):
             name of pretrained hugging face transformer model
         rank: int
             rank within distributed training
-        torch_dtype: torch type or str
+        dtype: torch type or str
             the floating point precision to use
         device_map: str
             determines whether you want to use model parallel or not
@@ -44,11 +44,11 @@ class SentenceAutoEncoder(torch.nn.Module):
         """
         super().__init__()
         self.model_string = model_string
-        if torch_dtype=="float32": torch_dtype = torch.float32
-        elif torch_dtype=="float16": torch_dtype = torch.float16
+        if dtype=="float32": dtype = torch.float32
+        elif dtype=="float16": dtype = torch.float16
         self.hf_model = AutoModelForCausalLM.from_pretrained(
             self.model_string,
-            torch_dtype=torch_dtype,
+            torch_dtype=dtype,
             device_map=device_map
         )
         self.rank = rank
@@ -57,8 +57,13 @@ class SentenceAutoEncoder(torch.nn.Module):
         self.n_cmps = n_cmps
         self.n_tsks = n_tsks
         t = self.hf_model.transformer
-        hsize = t.get_input_embeddings().weight.shape[-1]
+        tembs = t.get_input_embeddings().weight
+        hsize = tembs.shape[-1]
         self.embs = torch.nn.Embedding(self.n_cmps+self.n_tsks, hsize)
+        self.embs.to(dtype)
+        if tembs.get_device()>-1:
+            self.embs.to(tembs.get_device())
+
         self.cmp_ids = [i for i in range(self.n_cmps)]
         # sos is 0, rmb is 1
         self.tsk_ids = [i+self.n_cmps for i in range(self.n_tsks)]
@@ -402,7 +407,7 @@ class SentenceAutoEncoder(torch.nn.Module):
             logit = ret.logits
             if i==0:
                 logits.append(logit[:,:-1])
-                preds.append( input_ids[:,1:] )
+                preds.append( input_ids[:,1:].to(logit.get_device()) )
             logits.append(logit[:,-1:])
             pred = logit[:,-1]
             pred = torch.nn.functional.softmax(pred/temperature,dim=-1)
@@ -592,8 +597,8 @@ def loss_and_acc(preds, labels, attn, loss_fxn, loss_scale=1):
         a scalar that scales the loss
     """
     ps = preds.reshape(-1,preds.shape[-1])
-    labels = labels.reshape(-1)
-    idx = attn.bool().reshape(-1)
+    labels = labels.reshape(-1).to(ps.get_device())
+    idx = attn.bool().reshape(-1).to(ps.get_device())
     loss = loss_fxn(ps[idx],labels[idx])*loss_scale
     argmax = torch.argmax(ps[idx], dim=-1)
     acc = (argmax==labels[idx]).float().mean()
