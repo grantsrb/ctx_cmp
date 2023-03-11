@@ -93,11 +93,7 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
     # Wrap model to distribute loss calculations
     if verbose and rank==0:
         print("Wrapping Model")
-    wrapped_model = LossWrapper(
-        ddp_model,
-        tokenizer,
-        hyps=hyps
-    )
+    wrapped_model = LossWrapper( ddp_model, tokenizer, hyps=hyps )
     if not hyps["model_parallel"]:
         if verbose and rank==0:
             print("Putting Model On GPU")
