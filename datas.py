@@ -117,7 +117,6 @@ def get_loaders(hyps, tokenizer, model=None, val_only=False):
     else: model = None
 
     path = os.path.join(hyps["data_root"],dset)
-    if hyps["exp_name"]=="test": path = os.path.join(path,"debug")
     # Name data path with number of samples
     abbrev = hyps.get("abbrev_len", None)
     save_threshold = 100000
