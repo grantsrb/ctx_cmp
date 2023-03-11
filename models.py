@@ -448,6 +448,7 @@ class LossWrapper(torch.nn.Module):
                                              tforce=True,
                                              gen_targs=False,
                                              gen_ids=False,
+                                             no_grad=False,
                                              temperature=1.):
         """
         Args:
@@ -479,6 +480,10 @@ class LossWrapper(torch.nn.Module):
                 a temperature parameter for softmax sampling. Set to
                 low number for high confidence sampling, high value
                 for low confidence sampling
+            no_grad: bool
+                if true, this function will not call .backward() on
+                the loss. If false, this function will only call
+                .backward if in training mode.
         Returns:
             ret_dict: dict (keys: str, vals: torch tensor)
                 "loss": torch tensor (1,)
@@ -537,7 +542,7 @@ class LossWrapper(torch.nn.Module):
             acc = (argmax==labels).float().mean()
 
         sum_loss = loss
-        if self.training:
+        if self.training and not no_grad:
             if self.hyps["rmb_task"]: sum_loss += rmb_loss
             sum_loss.backward()
 

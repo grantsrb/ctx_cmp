@@ -1,3 +1,21 @@
+"""
+This script is used to evaluate trained models. Argue a model folder
+or a path to a specific checkpoint. The results will be saved to a
+csv called model_results.csv unless otherwise specified.
+
+$ python3 eval_model.py path/to/model_folder
+
+Or:
+
+$ python3 eval_model.py path/to/model_checkpt.pt
+
+If you would like to run the untrained model to see the baseline
+performance, either use the `baseline_performance.py` script or
+include `untrained` in the bash command.
+
+WARNING!!! BASELINE RESULTS:
+$ python3 eval_model.py path/to/model_folder untrained
+"""
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -79,6 +97,9 @@ if __name__=="__main__":
         hyps["results_file"] = "./baseline_results.csv"
         if hyps["abbrev_len"] is None: 
             hyps["abbrev_len"] = 1000
+        if len(sys.argv)>2:
+            hyps["val_batch_size"] = int(sys.argv[2])
+            hyps["batch_size"] = int(sys.argv[2])
     rank = 0
     verbose = True
     hyps["seed"] = hyps.get("seed", int(time.time()))

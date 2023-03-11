@@ -13,7 +13,7 @@ If you would like to run the untrained model to see the baseline
 performance, either use the `baseline_performance.py` script or
 include `untrained` in the bash command.
 
-WARNING!!! BASELINE RESULTS:
+WARNING!!! THE FOLLOWING LINE IS FOR BASELINE RESULTS:
 $ python3 eval_model.py path/to/model_folder untrained
 """
 import torch
@@ -26,9 +26,10 @@ import time
 from transformers import AutoTokenizer
 from tqdm import tqdm
 import sys
+import os
 
 from ml_utils.utils import try_key
-import ml_utils
+import ml_utils.save_io as io
 import datas
 from models import *
 from training import print_examples
@@ -67,29 +68,31 @@ if __name__=="__main__":
     rank = 0
     verbose = True
     results_file = "model_results.csv"
+    abbrev_len = 1000
+    untrained = False # Detemines if model should load saved checkpt
+    bsize = None # Determines batch size of evaluation
 
     path = sys.argv[1]
     for arg in sys.argv[1:]:
         if arg=="untrained": untrained = True
-        elif is_model_folder(arg): path = arg
-        else: print("Unrecognized arg", arg)
-    checkpt = ml_utils.save_io.load_checkpoint(path)
+        elif io.is_model_folder(arg): path = arg
+        else:
+            try:
+                bsize = int(arg)
+            except:
+                print("Unrecognized arg", arg)
+    checkpt = io.load_checkpoint(path)
     hyps = checkpt["hyps"]
+    if abbrev_len is not None: hyps["abbrev_len"] = abbrev_len
     hyps["results_file"] = results_file
     hyps["seed"] = hyps.get("seed", int(time.time()))
     if hyps["seed"] is None: hyps["seed"] = int(time.time())
     torch.manual_seed(hyps["seed"])
     hyps["loss_scale"] = 1./hyps["n_grad_loops"]
-    hyps["csl_task"] = False # Handled by high_loss and high_acc
-
-    hyps["device_map"] = "auto" if hyps["model_parallel"] else None
-    model = SentenceAutoEncoder(**hyps)
-    if not untrained: model.load_state_dict(checkpt["state_dict"])
-
-    # Wrap model and place on gpu
-    wrapped_model = LossWrapper( model, tokenizer, hyps=hyps )
-    if not hyps["model_parallel"]: wrapped_model.to(rank)
-
+    hyps["csl_task"] = False # CSL is handled by high_loss and high_acc
+    if bsize is not None:
+        hyps["batch_size"] = bsize
+        hyps["val_batch_size"] = bsize
 
     # Make Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(hyps["model_string"])
@@ -103,6 +106,14 @@ if __name__=="__main__":
         )
         # Adjust Model Embeddings for new token types
         model.add_embeddings(num_added)
+
+    hyps["device_map"] = "auto" if hyps["model_parallel"] else None
+    model = SentenceAutoEncoder(**hyps)
+    if not untrained: model.load_state_dict(checkpt["state_dict"])
+
+    # Wrap model and place on gpu
+    wrapped_model = LossWrapper( model, tokenizer, hyps=hyps )
+    if not hyps["model_parallel"]: wrapped_model.to(rank)
 
     # Make dataset
     if verbose and rank==0:
@@ -163,13 +174,14 @@ if __name__=="__main__":
                 ret_preds=True,
                 seq_len=hyps["seq_len"],
                 tforce=True,
-                gen_ids=try_key(hyps, "gen_ids", False)
+                gen_ids=try_key(hyps, "gen_ids", False),
+                no_grad=True
             )
             avgs["tpred_loss"] = package["loss"].item()
             avgs["tpred_acc"] = package["acc"].item()
             if "rmb_loss" in package:
-                avgs["trmb_avg_loss"] += package["rmb_loss"].item()
-                avgs["trmb_avg_acc"]  += package["rmb_acc"].item()
+                avgs["trmb_loss"] += package["rmb_loss"].item()
+                avgs["trmb_acc"]  += package["rmb_acc"].item()
 
             # High Train Type
             high_inpts = {
@@ -203,13 +215,14 @@ if __name__=="__main__":
                     ret_preds=True,
                     seq_len=hyps["seq_len"],
                     tforce=False,
-                    gen_ids=try_key(hyps, "gen_ids", False)
+                    gen_ids=try_key(hyps, "gen_ids", False),
+                    no_grad=True
                 )
                 avgs["pred_loss"] = package["loss"].item()
                 avgs["pred_acc"] = package["acc"].item()
                 if "rmb_loss" in package:
-                    avgs["rmb_avg_loss"] += package["rmb_loss"].item()
-                    avgs["rmb_avg_acc"]  += package["rmb_acc"].item()
+                    avgs["rmb_loss"] += package["rmb_loss"].item()
+                    avgs["rmb_acc"]  += package["rmb_acc"].item()
 
                 # High Eval Type
                 high_loss, high_acc = get_metrics(
@@ -276,13 +289,14 @@ if __name__=="__main__":
                     ret_preds=True,
                     seq_len=hyps["seq_len"],
                     tforce=False,
-                    gen_ids=try_key(hyps, "gen_ids", False)
+                    gen_ids=try_key(hyps, "gen_ids", False),
+                    no_grad=True
                 )
                 avgs["pred_loss"] = package["loss"].item()
                 avgs["pred_acc"] = package["acc"].item()
                 if "rmb_loss" in package:
-                    avgs["rmb_avg_loss"] += package["rmb_loss"].item()
-                    avgs["rmb_avg_acc"]  += package["rmb_acc"].item()
+                    avgs["rmb_loss"] += package["rmb_loss"].item()
+                    avgs["rmb_acc"]  += package["rmb_acc"].item()
 
                 # High Eval Type
                 high_inpts = {
