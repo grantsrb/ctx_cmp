@@ -15,7 +15,6 @@ class SentenceAutoEncoder(torch.nn.Module):
                                              n_cmps=3,
                                              n_tsks=2,
                                              train_embs=False,
-                                             train_lmhead=False,
                                              *args, **kwargs):
         """
         model_string: str
@@ -114,7 +113,7 @@ class SentenceAutoEncoder(torch.nn.Module):
         # inpt_embs are padded on left side, so we can append the cmp
         # tokens to the right side and pad the attention
         inpt_embs = model_embs( input_ids )
-        if self.train_embs: inpt_embs = inpt_embs.data
+        if not self.train_embs: inpt_embs = inpt_embs.data
         cmp_embs = self.embs.weight[self.cmp_ids[0]:self.cmp_ids[-1]+1]
         inpt_embs = torch.cat(
             [inpt_embs, cmp_embs[None].repeat(len(inpt_embs),1,1)],
@@ -138,8 +137,16 @@ class SentenceAutoEncoder(torch.nn.Module):
             cmpr = fx["hidden_states"][n_layers//2][:,-self.n_cmps:]
         elif isinstance(self.cmp_layer, int):
             cmpr = fx["hidden_states"][self.cmp_layer][:,-self.n_cmps:]
-        else:
-            raise NotImplemented
+        # Can use linear combo of embeddings as compressed representations
+        elif self.cmp_layer=="output":
+            logits = fx["last_hidden_state"]
+            shape = logits.shape
+            logits = model.lm_head(logits.reshape(-1,shape[-1]))
+            emb = model_embs.weight
+            if not self.train_embs: emb = emb.data
+            cmpr = logits.reshape(-1, logits.shape[-1])
+            cmpr = torch.mm(cmpr, emb)
+            cmpr = cmpr.reshape(*shape[:-1], cmpr.shape[-1])
         return cmpr
 
     def forward(self, data, tforce=True):
@@ -184,7 +191,7 @@ class SentenceAutoEncoder(torch.nn.Module):
         model = self.hf_model
         model_embs = model.transformer.get_input_embeddings()
         out_embs =  model_embs(data["output_ids"])
-        if self.train_embs: out_embs = out_embs.data
+        if not self.train_embs: out_embs = out_embs.data
         # Concat compressed representation and start of sentence token
         # to beginning of sentence and pad attention accordingly
         sos = self.embs.weight[self.tsk_ids[0]][None,None]
@@ -306,7 +313,7 @@ class SentenceAutoEncoder(torch.nn.Module):
             pred = torch.multinomial(pred,1,replacement=True)
             preds.append(pred)
             out_embs = t_embs( pred.to(self.rank) )
-            if self.train_embs: out_embs = out_embs.data
+            if not self.train_embs: out_embs = out_embs.data
             emb_list.append(out_embs)
 
         ret = { "preds": torch.cat(preds,dim=1) }
@@ -388,7 +395,7 @@ class SentenceAutoEncoder(torch.nn.Module):
                 if pred_len is not None: pred_len -= 1
             inputs_embeds = inputs_embeds[:,:seed_len]
             input_ids = torch.zeros_like(inputs_embeds[:,:,0])
-        if self.train_embs: inputs_embeds = inputs_embeds.data
+        if not self.train_embs: inputs_embeds = inputs_embeds.data
 
         if pred_len is None:
             n_loops = attention_mask.shape[1]-seed_len
@@ -414,7 +421,7 @@ class SentenceAutoEncoder(torch.nn.Module):
             pred = torch.multinomial(pred,1,replacement=True)
             preds.append(pred)
             inputs_embeds = t_embs( pred.to(self.rank) )
-            if self.train_embs: inputs_embeds = inputs_embeds.data
+            if not self.train_embs: inputs_embeds = inputs_embeds.data
         preds = torch.cat(preds,dim=1)
         if ret_logits:
             return preds, torch.cat(logits, dim=1)
