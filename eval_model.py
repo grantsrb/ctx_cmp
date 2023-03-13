@@ -101,11 +101,15 @@ if __name__=="__main__":
     # Add important tokens
     num_added = 0
     if tokenizer.pad_token is None:
-        num_added += tokenizer.add_special_tokens(
+        tokenizer.add_special_tokens(
             {"pad_token": hyps.get("pad_token", tokenizer.eos_token)}
         )
-        # Adjust Model Embeddings for new token types
-        model.add_embeddings(num_added)
+        if tokenizer.pad_token != tokenizer.eos_token:
+            print("PAD {} different from EOS {}".format(
+                tokenizer.pad_token, tokenizer.eos_token
+            ))
+            # Adjust Model Embeddings for new token types
+            model.add_embeddings(1)
 
     hyps["device_map"] = "auto" if hyps["model_parallel"] else None
     model = SentenceAutoEncoder(**hyps)
@@ -113,7 +117,8 @@ if __name__=="__main__":
 
     # Wrap model and place on gpu
     wrapped_model = LossWrapper( model, tokenizer, hyps=hyps )
-    if not hyps["model_parallel"]: wrapped_model.to(rank)
+    if not hyps["model_parallel"]:
+        wrapped_model.to(rank)
 
     # Make dataset
     if verbose and rank==0:
