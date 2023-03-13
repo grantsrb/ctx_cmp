@@ -127,6 +127,8 @@ def get_loaders(hyps, tokenizer, model=None, val_only=False):
             path = path + str(abbrev//1000)+"k"
     if hyps["cmp_len"]!=10 or hyps["seq_len"]!=20:
         path=path+"cmpr{}seq{}".format(hyps["cmp_len"],hyps["seq_len"])
+    if hyps["model_string"]!="bigscience/bloomz-560m":
+        path = path + hyps["model_string"].replace("/","")
     if not os.path.exists(path): os.makedirs(path)
 
     # Load previously saved data
