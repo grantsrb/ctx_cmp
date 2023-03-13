@@ -15,6 +15,7 @@ class SentenceAutoEncoder(torch.nn.Module):
                                              n_cmps=3,
                                              n_tsks=2,
                                              train_embs=False,
+                                             proj_cmpr=False,
                                              *args, **kwargs):
         """
         model_string: str
@@ -40,6 +41,10 @@ class SentenceAutoEncoder(torch.nn.Module):
         train_embs: bool
             if false, uses data of transformer embedding parameters
             instead of embedding parameters directly.
+        proj_cmpr: bool
+            if true, projects the cmpr' representations using a linear
+            weight matrix before using them as input to the forward/
+            auxiliary tasks.
         """
         super().__init__()
         self.model_string = model_string
@@ -55,6 +60,7 @@ class SentenceAutoEncoder(torch.nn.Module):
         self.rmb_task = rmb_task
         self.n_cmps = n_cmps
         self.n_tsks = n_tsks
+
         t = self.hf_model.transformer
         tembs = t.get_input_embeddings().weight
         hsize = tembs.shape[-1]
@@ -62,6 +68,9 @@ class SentenceAutoEncoder(torch.nn.Module):
         self.embs.to(dtype)
         if tembs.get_device()>-1:
             self.embs.to(tembs.get_device())
+        self.proj_cmpr = None
+        if proj_cmpr:
+            self.proj_cmpr = nn.Linear(hsize, hsize)
 
         self.cmp_ids = [i for i in range(self.n_cmps)]
         # sos is 0, rmb is 1
@@ -150,6 +159,10 @@ class SentenceAutoEncoder(torch.nn.Module):
             cmpr = torch.mm(cmpr, emb)
             cmpr = cmpr.reshape(*shape[:-1], cmpr.shape[-1])
             cmpr = cmpr/shape[1]
+        if self.proj_cmpr is not None:
+            shape = cmpr.shape
+            cmpr = self.proj_cmpr(cmpr.reshape(-1,shape[-1]))
+            cmpr = cmpr.reshape(shape)
         return cmpr
 
     def forward(self, data, tforce=True):
