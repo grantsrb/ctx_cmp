@@ -118,6 +118,11 @@ then running the following command:
         representation. -1 will take the last layer, "half" will take
         from the middle layer. All integer arguments must be within
         the number of layers of the model.
+    "proj_cmpr": bool
+        if true, projects the cmpr' representations (the representations
+        at the intermediate layer of the transformer formed during
+        compression) using a linear weight matrix before using them as
+        input to the forward/auxiliary tasks.
     "rmb_rask": bool
         if true, and using openwebtext dataset, model will have
         auxiliary compression autoencoding task to reconstruct the
