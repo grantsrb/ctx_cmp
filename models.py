@@ -144,9 +144,12 @@ class SentenceAutoEncoder(torch.nn.Module):
             logits = model.lm_head(logits.reshape(-1,shape[-1]))
             emb = model_embs.weight
             if not self.train_embs: emb = emb.data
-            cmpr = logits.reshape(-1, logits.shape[-1])
+            cmpr = torch.nn.functional.softmax(
+                logits.reshape(-1, logits.shape[-1]), dim=-1
+            )
             cmpr = torch.mm(cmpr, emb)
             cmpr = cmpr.reshape(*shape[:-1], cmpr.shape[-1])
+            cmpr = cmpr/shape[1]
         return cmpr
 
     def forward(self, data, tforce=True):

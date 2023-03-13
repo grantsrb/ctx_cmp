@@ -116,8 +116,8 @@ def get_loaders(hyps, tokenizer, model=None, val_only=False):
         hyps["n_data_procs"] = 1
     else: model = None
 
-    path = os.path.join(hyps["data_root"],dset)
     # Name data path with number of samples
+    path = os.path.join(hyps["data_root"],dset)
     abbrev = hyps.get("abbrev_len", None)
     save_threshold = 100000
     if abbrev is not None and abbrev>=save_threshold:
@@ -125,8 +125,11 @@ def get_loaders(hyps, tokenizer, model=None, val_only=False):
             path = path + str(abbrev//1000000)+"m"
         elif abbrev>=1000:
             path = path + str(abbrev//1000)+"k"
+    if hyps["cmp_len"]!=10 or hyps["seq_len"]!=20:
+        path=path+"cmpr{}seq{}".format(hyps["cmp_len"],hyps["seq_len"])
     if not os.path.exists(path): os.makedirs(path)
 
+    # Load previously saved data
     trpath = os.path.join(path,"train")
     if (abbrev is None or abbrev>=100000) and os.path.exists(trpath):
         print("Loading data from", trpath)
@@ -134,6 +137,7 @@ def get_loaders(hyps, tokenizer, model=None, val_only=False):
         val_path = os.path.join(path, "val")
         print("Loading data from", val_path)
         valset = datasets.load_from_disk(val_path)
+    # Make new data from glue
     elif hyps["dataset"]=="glue":
         encode_fxn = lambda x: pair_encode(
             x,
@@ -161,6 +165,7 @@ def get_loaders(hyps, tokenizer, model=None, val_only=False):
                 ["sentence1", "sentence2", "idx", "label"]
             )
             valset.save_to_disk(os.path.join(path, "val"))
+    # Make new data from openwebtext
     elif hyps["dataset"]=="openwebtext":
         print("Failed to find", trpath, "Manually loading dataset")
         if try_key(hyps,"rmb_only",False):
