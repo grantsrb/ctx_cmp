@@ -478,7 +478,8 @@ class LossWrapper(torch.nn.Module):
                                              gen_targs=False,
                                              gen_ids=False,
                                              no_grad=False,
-                                             temperature=1.):
+                                             temperature=1.,
+                                             top_k=5):
         """
         Args:
             data: dict
@@ -513,6 +514,8 @@ class LossWrapper(torch.nn.Module):
                 if true, this function will not call .backward() on
                 the loss. If false, this function will only call
                 .backward if in training mode.
+            top_k: int optional
+                if argued, returns a calculation of the top_k accuracy
         Returns:
             ret_dict: dict (keys: str, vals: torch tensor)
                 "loss": torch tensor (1,)
@@ -526,6 +529,10 @@ class LossWrapper(torch.nn.Module):
                 "rmb_preds": torch tensor (B,S,P)
                     the rmb prediction logits. only returned if ret_preds
                     is true
+                "top_k": torch tensor (1,)
+                    the forward top n accuracy
+                "rmb_top_k": torch tensor (1,)
+                    the rmb top n accuracy.
         """
         if gen_targs: 
             print("Generating Targets")
@@ -544,23 +551,34 @@ class LossWrapper(torch.nn.Module):
             data["output_logits"] = output_logits[:,-idx:].data
             del output_logits
 
+        ret_dict = dict()
         n_cmps = self.model.n_cmps
         if self.hyps["rmb_task"]:
             preds, rmb_preds = self.model(data, tforce=tforce)
             # Need to remove CMP representation, the first n elements
-            rmb_loss, rmb_acc = loss_and_acc(
+            rmb = loss_and_acc(
                 preds=rmb_preds, labels=data["input_ids"],
                 attn=data["attention_mask"], loss_fxn=self.loss_fxn,
-                loss_scale=self.loss_scale
+                loss_scale=self.loss_scale,
+                top_k=top_k
             )
+            rmb_loss = rmb["loss"]
+            ret_dict["rmb_loss"] = rmb["loss"]
+            ret_dict["rmb_acc"] = rmb["acc"]
+            ret_dict["rmb_top_k"] = rmb["top_k"]
         else:
             preds = self.model(data, tforce=tforce)
 
         if gen_ids or "output_logits" not in data:
-            loss, acc = loss_and_acc(
+            landa = loss_and_acc(
                 preds, data["output_ids"], attn=data["output_attn_mask"],
-                loss_fxn=self.loss_fxn, loss_scale=self.loss_scale
+                loss_fxn=self.loss_fxn, loss_scale=self.loss_scale,
+                top_k=top_k
             )
+            loss, acc = landa["loss"], landa["acc"]
+            ret_dict["loss"] = landa["loss"]
+            ret_dict["acc"] = landa["acc"]
+            ret_dict["top_k"] = landa["top_k"]
         else:
             ps = preds.reshape(-1, preds.shape[-1])
             labels = data["output_ids"].reshape(-1)
@@ -569,20 +587,18 @@ class LossWrapper(torch.nn.Module):
             loss = self.loss_fxn(ps, target)*self.loss_scale
             argmax = torch.argmax(ps, dim=-1)
             acc = (argmax==labels).float().mean()
+            ret_dict["loss"] = loss
+            ret_dict["acc"] = acc
 
         sum_loss = loss
         if self.training and not no_grad:
             if self.hyps["rmb_task"]: sum_loss += rmb_loss
             sum_loss.backward()
 
-        ret_dict = { "loss": loss, "acc": acc, }
-        if self.hyps["rmb_task"]:
-            ret_dict["rmb_loss"] = rmb_loss
-            ret_dict["rmb_acc"] = rmb_acc
-            if ret_preds:
-                ret_dict["rmb_preds"] = rmb_preds
         if ret_preds:
             ret_dict["preds"] = preds
+            if self.hyps["rmb_task"]:
+                ret_dict["rmb_preds"] = rmb_preds
 
         # Do causal lm task after everything else to save space on
         # gpu.
@@ -601,23 +617,26 @@ class LossWrapper(torch.nn.Module):
               **causal_inpts, tforce=True, ret_logits=True, seed_len=0
             )
             # Calculate loss
-            loss, acc = loss_and_acc(
+            landa = loss_and_acc(
                 preds, causal_inpts["input_ids"][:,1:],
                 attn=causal_inpts["attention_mask"][:,1:],
                 loss_fxn=self.loss_fxn,
-                loss_scale=self.loss_scale
+                loss_scale=self.loss_scale,
+                top_k=5
             )
+            loss, acc = landa["loss"], landa["acc"]
             loss = loss*self.csl_scale
             # Backpropagate error
             if self.training:
                 loss.backward()
             ret_dict["csl_loss"] = loss
             ret_dict["csl_acc"] = acc
+            ret_dict["csl_top_k"] = landa["top_k"]
             if ret_preds:
                 ret_dict["csl_preds"] = preds
         return ret_dict
 
-def loss_and_acc(preds, labels, attn, loss_fxn, loss_scale=1):
+def loss_and_acc(preds, labels, attn, loss_fxn, loss_scale=1,top_k=None):
     """
     preds: torch float tensor (B,S,L)
         prediction logits
@@ -629,6 +648,8 @@ def loss_and_acc(preds, labels, attn, loss_fxn, loss_scale=1):
         the loss function for the predictions
     loss_scale: float
         a scalar that scales the loss
+    top_k: int optional
+        if argued, returns a calculation of the top_k accuracy
     """
     ps = preds.reshape(-1,preds.shape[-1])
     device = ps.get_device()
@@ -639,7 +660,15 @@ def loss_and_acc(preds, labels, attn, loss_fxn, loss_scale=1):
         device = "cpu"
         labels = labels.reshape(-1).to(device)
         idx = attn.bool().reshape(-1).to(device)
-    loss = loss_fxn(ps[idx],labels[idx])*loss_scale
     argmax = torch.argmax(ps[idx], dim=-1)
-    acc = (argmax==labels[idx]).float().mean()
-    return loss, acc
+    ret_dict = {
+        "loss": loss_fxn(ps[idx],labels[idx])*loss_scale,
+        "acc": (argmax==labels[idx]).float().mean(),
+        "top_k": torch.zeros(1),
+    }
+    if top_k is not None:
+        ret_dict["top_k"] = utils.top_k_acc(
+            ps[idx], labels[idx], top_k, as_tensor=True
+        )
+    return ret_dict
+

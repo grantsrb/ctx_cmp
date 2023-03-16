@@ -59,7 +59,8 @@ hyps = {
     "n_grad_loops": 1,
 }
 
-def get_metrics(hyps, model, inpts, loss_fxn, seed_len=3, tforce=True):
+def get_metrics(hyps, model, inpts, loss_fxn, seed_len=3, tforce=True,
+                                                          top_k=5):
     """
     Calculates the loss and accuracy using causal language modeling
 
@@ -74,6 +75,8 @@ def get_metrics(hyps, model, inpts, loss_fxn, seed_len=3, tforce=True):
         loss_fxn: torch loss function
         tforce: bool
             if true, predictions are teacher forced
+        top_k: int optional
+            if argued, returns a calculation of the top_k accuracy
     """
     # Make predictions
     preds, logits = model.causal_lm(
@@ -81,13 +84,14 @@ def get_metrics(hyps, model, inpts, loss_fxn, seed_len=3, tforce=True):
     )
     logits = logits[:, seed_len:]
     # Calculate loss
-    loss, acc = loss_and_acc(
+    landa = loss_and_acc(
         logits, inpts["input_ids"][:,seed_len+1:],
         attn=inpts["attention_mask"][:,seed_len+1:],
         loss_fxn=loss_fxn,
-        loss_scale=1
+        loss_scale=1,
+        top_k=top_k
     )
-    return loss, acc
+    return landa
 
 if __name__=="__main__":
     rank = 0
@@ -158,6 +162,10 @@ if __name__=="__main__":
         "low_acc": 0,
         "thigh_acc": 0,
         "high_acc": 0,
+        "tlow_top_k": 0,
+        "low_top_k": 0,
+        "thigh_top_k": 0,
+        "high_top_k": 0,
     }
     for i,data in tqdm(enumerate(dataloader)):
         if not hyps["model_parallel"]:
@@ -168,21 +176,25 @@ if __name__=="__main__":
                 "attention_mask": data["output_attn_mask"],
             }
             model.train()
-            tlow_loss, tlow_acc = get_metrics(
+            landa = get_metrics(
               hyps, model, low_inpts, loss_fxn,
               tforce=True, seed_len=0
             )
+            tlow_loss, tlow_acc = landa["loss"], landa["acc"]
             avgs["tlow_loss"] += tlow_loss.item()*hyps["loss_scale"]
             avgs["tlow_acc"] += tlow_acc.item()
+            avgs["tlow_top_k"] += landa["top_k"].item()
 
             if valloader==dataloader:
                 model.eval()
-                low_loss, low_acc = get_metrics(
+                landa = get_metrics(
                   hyps, model, low_inpts, loss_fxn,
                   tforce=False, seed_len=max(hyps.get("seq_overlap",1),1)
                 )
+                low_loss, low_acc = landa["loss"], landa["acc"]
                 avgs["low_loss"] += low_loss.item()*hyps["loss_scale"]
                 avgs["low_acc"] +=  low_acc.item()
+                avgs["low_top_k"] += landa["top_k"].item()
 
             high_inpts = {
               "input_ids": torch.cat([
@@ -193,20 +205,24 @@ if __name__=="__main__":
               ], dim=1)
             }
             model.train()
-            thigh_loss, thigh_acc = get_metrics(
+            landa = get_metrics(
               hyps, model, high_inpts, loss_fxn, tforce=True, seed_len=0
             )
+            thigh_loss, thigh_acc = landa["loss"], landa["acc"]
             avgs["thigh_loss"] += thigh_loss.item()*hyps["loss_scale"]
             avgs["thigh_acc"] += thigh_acc.item()
+            avgs["thigh_top_k"] += landa["top_k"].item()
 
             if valloader==dataloader:
                 model.eval()
-                high_loss, high_acc = get_metrics(
+                landa = get_metrics(
                     hyps, model, high_inpts, loss_fxn, tforce=False,
                     seed_len=data["input_ids"].shape[1]
                 )
+                high_loss, high_acc = landa["loss"], landa["acc"]
                 avgs["high_loss"] += high_loss.item()*hyps["loss_scale"]
                 avgs["high_acc"] +=  high_acc.item()
+                avgs["high_top_k"] += landa["top_k"].item()
         if (i+1) > hyps.get("n_train_loops", np.inf): break
     for k,v in avgs.items():
         avgs[k] = round(v/(i+1), 4)
@@ -236,12 +252,14 @@ if __name__=="__main__":
                     "attention_mask": data["output_attn_mask"],
                 }
                 model.eval()
-                low_loss, low_acc = get_metrics(
+                landa = get_metrics(
                   hyps, model, low_inpts, loss_fxn,
                   tforce=False, seed_len=max(hyps.get("seq_overlap",1),1)
                 )
+                low_loss, low_acc = landa["loss"], landa["acc"]
                 avgs["low_loss"] += low_loss.item()*hyps["loss_scale"]
                 avgs["low_acc"] +=  low_acc.item()
+                avgs["low_top_k"] += landa["top_k"].item()
 
                 high_inpts = {
                   "input_ids": torch.cat([
@@ -252,12 +270,14 @@ if __name__=="__main__":
                   ], dim=1)
                 }
                 model.eval()
-                high_loss, high_acc = get_metrics(
+                landa = get_metrics(
                     hyps, model, high_inpts, loss_fxn, tforce=False,
                     seed_len=data["input_ids"].shape[1]
                 )
+                high_loss, high_acc = landa["loss"], landa["acc"]
                 avgs["high_loss"] += high_loss.item()*hyps["loss_scale"]
                 avgs["high_acc"] +=  high_acc.item()
+                avgs["high_top_k"] += landa["top_k"].item()
             if (i+1) > hyps.get("max_val_loops", np.inf): break
         for k,v in avgs.items():
             if "t"!=k[0]:
