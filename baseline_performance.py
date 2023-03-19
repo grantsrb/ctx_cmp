@@ -91,16 +91,16 @@ def get_metrics(hyps, model, inpts, loss_fxn, seed_len=3, tforce=True):
 
 if __name__=="__main__":
     rank = 0
+
     # Hyperparameters
     if len(sys.argv)>1:
         hyps = ml_utils.save_io.load_json(sys.argv[1])
         hyps["results_file"] = "./baseline_results.csv"
         if hyps["abbrev_len"] is None: 
-            hyps["abbrev_len"] = 1000
+            hyps["abbrev_len"] = 10000
         if len(sys.argv)>2:
             hyps["val_batch_size"] = int(sys.argv[2])
             hyps["batch_size"] = int(sys.argv[2])
-    rank = 0
     verbose = True
     hyps["seed"] = hyps.get("seed", int(time.time()))
     if hyps["seed"] is None: hyps["seed"] = int(time.time())
@@ -109,21 +109,31 @@ if __name__=="__main__":
 
     hyps["device_map"] = "auto" if hyps["model_parallel"] else None
     model = SentenceAutoEncoder(**hyps)
-    model.to(rank)
+    if not hyps["model_parallel"]:
+        model.to(rank)
     model.eval()
+    print("Embedding Size:", model.get_embeddings().weight.shape)
 
     # Make Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(hyps["model_string"])
     tokenizer.truncation_side = "right"
 
     # Add important tokens
-    num_added = 0
     if tokenizer.pad_token is None:
-        num_added += tokenizer.add_special_tokens(
+        print("No Pad Token")
+        print("EOS:", tokenizer.eos_token)
+        print("BOS:", tokenizer.bos_token)
+        print("CLS:", tokenizer.cls_token)
+        tokenizer.add_special_tokens(
             {"pad_token": hyps.get("pad_token", tokenizer.eos_token)}
         )
-        # Adjust Model Embeddings for new token types
-        model.add_embeddings(num_added)
+        print("PAD:", tokenizer.pad_token)
+        if tokenizer.pad_token != tokenizer.eos_token:
+            print("PAD {} different from EOS {}".format(
+                tokenizer.pad_token, tokenizer.eos_token
+            ))
+            # Adjust Model Embeddings for new token types
+            model.add_embeddings(1)
 
     # Make dataset
     if verbose and rank==0:
@@ -150,7 +160,8 @@ if __name__=="__main__":
         "high_acc": 0,
     }
     for i,data in tqdm(enumerate(dataloader)):
-        data = {k: v.to(rank) for k,v in data.items()}
+        if not hyps["model_parallel"]:
+            data = {k: v.to(rank) for k,v in data.items()}
         with torch.no_grad():
             low_inpts = {
                 "input_ids": data["output_ids"],
@@ -217,7 +228,8 @@ if __name__=="__main__":
     if valloader!=dataloader:
         print("Using Separate Validation Loader")
         for i,data in tqdm(enumerate(valloader)):
-            data = {k: v.to(rank) for k,v in data.items()}
+            if not hyps["model_parallel"]:
+                data = {k: v.to(rank) for k,v in data.items()}
             with torch.no_grad():
                 low_inpts = {
                     "input_ids": data["output_ids"],

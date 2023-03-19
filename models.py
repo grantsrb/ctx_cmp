@@ -92,6 +92,12 @@ class SentenceAutoEncoder(torch.nn.Module):
         for k,v in new_attrs.items():
             setattr(self, k, v)
 
+    def get_embeddings(self):
+        """
+        Returns a reference to the transformer embeddings.
+        """
+        return self.hf_model.transformer.get_input_embeddings()
+
     def add_embeddings(self, n_embs):
         """
         Args:
@@ -99,7 +105,7 @@ class SentenceAutoEncoder(torch.nn.Module):
                 the number of embeddings to add
         """
         if n_embs <= 0: return
-        embs = self.hf_model.transformer.get_input_embeddings()
+        embs = self.get_embeddings()
         n,h = embs.weight.shape
         self.hf_model.resize_token_embeddings(n+n_embs)
 
@@ -630,8 +636,14 @@ def loss_and_acc(preds, labels, attn, loss_fxn, loss_scale=1):
         a scalar that scales the loss
     """
     ps = preds.reshape(-1,preds.shape[-1])
-    labels = labels.reshape(-1).to(ps.get_device())
-    idx = attn.bool().reshape(-1).to(ps.get_device())
+    device = ps.get_device()
+    try:
+        labels = labels.reshape(-1).to(device)
+        idx = attn.bool().reshape(-1).to(device)
+    except:
+        device = "cpu"
+        labels = labels.reshape(-1).to(device)
+        idx = attn.bool().reshape(-1).to(device)
     loss = loss_fxn(ps[idx],labels[idx])*loss_scale
     argmax = torch.argmax(ps[idx], dim=-1)
     acc = (argmax==labels[idx]).float().mean()
