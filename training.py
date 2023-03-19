@@ -113,6 +113,8 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
     if try_key(hyps,"train_lmhead",False):
         mod = model.hf_model.lm_head
         params = params.union(mod.parameters())
+    if hyps.get("proj_cmpr", False):
+        params = params.union(model.proj_cmpr.parameters())
     for name, p in ddp_model.named_parameters():
         if p not in params:
             p.requires_grad = False

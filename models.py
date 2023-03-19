@@ -77,7 +77,7 @@ class SentenceAutoEncoder(torch.nn.Module):
             self.embs.to(tembs.get_device())
         self.proj_cmpr = None
         if proj_cmpr:
-            self.proj_cmpr = nn.Linear(hsize, hsize)
+            self.proj_cmpr = torch.nn.Linear(hsize, hsize)
 
         self.cmp_ids = [i for i in range(self.n_cmps)]
         # sos is 0, rmb is 1
@@ -177,8 +177,13 @@ class SentenceAutoEncoder(torch.nn.Module):
             cmpr = cmpr/shape[1]
         if self.proj_cmpr is not None:
             shape = cmpr.shape
-            cmpr = self.proj_cmpr(cmpr.reshape(-1,shape[-1]))
-            cmpr = cmpr.reshape(shape)
+            cmpr = cmpr.reshape(-1,shape[-1])
+            try:
+                proj = self.proj_cmpr(cmpr)
+            except:
+                self.proj_cmpr.to(cmpr.get_device())
+                proj = self.proj_cmpr(cmpr)
+            cmpr = proj.reshape(shape)
         return cmpr
 
     def forward(self, data, tforce=True):
