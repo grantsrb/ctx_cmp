@@ -123,6 +123,9 @@ then running the following command:
         at the intermediate layer of the transformer formed during
         compression) using a linear weight matrix before using them as
         input to the forward/auxiliary tasks.
+    "sep_cmpr": bool
+        if true, an additional token is created and inserted between
+        the cmpr tokens and the compression sequence during compression
     "rmb_rask": bool
         if true, and using openwebtext dataset, model will have
         auxiliary compression autoencoding task to reconstruct the
