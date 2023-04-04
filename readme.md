@@ -123,6 +123,11 @@ then running the following command:
         at the intermediate layer of the transformer formed during
         compression) using a linear weight matrix before using them as
         input to the forward/auxiliary tasks.
+    "proj_hid_mult": float or None
+        if a float value is argued and `proj_cmpr` is true, the
+        projection will use a 2 layer neural net with a hidden layer
+        size of `proj_hid_mult * h_size` instead of using a single
+        linear projection.
     "sep_cmpr": bool
         if true, an additional token is created and inserted between
         the cmpr tokens and the compression sequence during compression

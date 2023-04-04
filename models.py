@@ -17,6 +17,7 @@ class SentenceAutoEncoder(torch.nn.Module):
                                              n_tsks=2,
                                              train_embs=False,
                                              proj_cmpr=False,
+                                             proj_hid_size=None,
                                              sep_cmpr=False,
                                              *args, **kwargs):
         """
@@ -47,6 +48,9 @@ class SentenceAutoEncoder(torch.nn.Module):
             if true, projects the cmpr' representations using a linear
             weight matrix before using them as input to the forward/
             auxiliary tasks.
+        proj_hid_size: int or None
+            if an integer value is argued, the projection will use a 2
+            layer neural net instead of a single linear projection.
         sep_cmpr: bool
             if true, an additional embedding is inserted between
             the cmpr token and the compression sequence.
@@ -78,7 +82,15 @@ class SentenceAutoEncoder(torch.nn.Module):
             self.embs.to(tembs.get_device())
         self.proj_cmpr = None
         if proj_cmpr:
-            self.proj_cmpr = torch.nn.Linear(hsize, hsize)
+            if proj_hid_mult and proj_hid_mult>0:
+                hid = proj_hid_mult*hsize
+                self.proj_cmpr = torch.nn.Sequential([
+                    torch.nn.Linear(hsize, hid),
+                    torch.nn.ReLU(),
+                    torch.nn.Linear(hid, hsize)
+                ])
+            else:
+                self.proj_cmpr = torch.nn.Linear(hsize, hsize)
 
         self.cmp_ids = [i for i in range(self.n_cmps)]
         # sos is 0, rmb is 1
