@@ -127,6 +127,7 @@ def get_loaders(hyps, tokenizer, model=None, val_only=False):
             path = path + str(abbrev//1000)+"k"
     if hyps["cmp_len"]!=10 or hyps["seq_len"]!=20:
         path=path+"cmpr{}seq{}".format(hyps["cmp_len"],hyps["seq_len"])
+    # Default is bigscience/bloomz-560m, so we only add if not that
     if hyps["model_string"]!="bigscience/bloomz-560m":
         path = path + hyps["model_string"].replace("/","")
     if not os.path.exists(path): os.makedirs(path)
@@ -134,10 +135,12 @@ def get_loaders(hyps, tokenizer, model=None, val_only=False):
     # Load previously saved data
     trpath = os.path.join(path,"train")
     if (abbrev is None or abbrev>=100000) and os.path.exists(trpath):
-        print("Loading data from", trpath)
+        if hyps.get("rank",0)==0:
+            print("Loading data from", trpath)
         dataset = datasets.load_from_disk(trpath)
         val_path = os.path.join(path, "val")
-        print("Loading data from", val_path)
+        if hyps.get("rank",0)==0:
+            print("Loading data from", val_path)
         valset = datasets.load_from_disk(val_path)
     # Make new data from glue
     elif hyps["dataset"]=="glue":
@@ -169,9 +172,10 @@ def get_loaders(hyps, tokenizer, model=None, val_only=False):
             valset.save_to_disk(os.path.join(path, "val"))
     # Make new data from openwebtext
     elif hyps["dataset"]=="openwebtext":
-        print("Failed to find", trpath, "Manually loading dataset")
+        if hyps.get("rank",0)==0:
+            print("Failed to find", trpath, "Manually loading dataset")
         if try_key(hyps,"rmb_only",False):
-            print("RMB Only")
+            if hyps.get("rank",0)==0: print("RMB Only")
             encode_fxn = lambda x: owt_autoencode(
                 x,
                 tokenizer=tokenizer,
@@ -197,7 +201,8 @@ def get_loaders(hyps, tokenizer, model=None, val_only=False):
             if abrv is None: abrv = 600
             dataset = dataset[:abrv]
             dataset = datasets.Dataset.from_dict(dataset)
-        print("Mapping Encoder Function")
+        if hyps.get("rank",0)==0:
+            print("Mapping Encoder Function")
         bsize = 1000 if model is None else\
                 try_key(hyps,"data_batch_size",100)
         dataset = dataset.map(

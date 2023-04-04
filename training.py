@@ -38,11 +38,11 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
     hyps["seed"] = try_key(hyps, "seed", int(time.time()))
     if hyps["seed"] is None: hyps["seed"] = int(time.time())
     torch.manual_seed(hyps["seed"]*rank)
+    hyps["rank"] = rank
 
     hyps["device_map"] = "auto" if hyps["model_parallel"] else None
     model = SentenceAutoEncoder(**hyps)
-    if hyps["multi_gpu"]: ddp_model = DDP(model, device_ids=[rank])
-    else: ddp_model = model
+    if not hyps["model_parallel"]: model.to(rank)
 
     # Make Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_string)
@@ -71,11 +71,8 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
     hyps["pad_token"] = tokenizer.pad_token
 
     # Adjust Model Embeddings for new token types
-    if hyps["multi_gpu"]: model = ddp_model.model
-    else: model = ddp_model
     model.add_embeddings(num_added)
-    if not hyps["model_parallel"]:
-        model.to(rank)
+
 
     # Make dataset
     if verbose and rank==0:
@@ -93,13 +90,11 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
     # Wrap model to distribute loss calculations
     if verbose and rank==0:
         print("Wrapping Model")
-    wrapped_model = LossWrapper( ddp_model, tokenizer, hyps=hyps )
+    wrapped_model = LossWrapper( model, tokenizer, hyps=hyps )
     if not hyps["model_parallel"]:
         if verbose and rank==0:
             print("Putting Model On GPU")
         wrapped_model.to(rank)
-    # Mayber better to parallelize after wrap, unsure at this point
-    #ddp_model = DDP(wrapped_model, device_ids=[rank])
 
     # Turn off gradient calculations for everything except for the
     # embedding matrix.
@@ -115,10 +110,10 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
         params = params.union(mod.parameters())
     if hyps.get("proj_cmpr", False):
         params = params.union(model.proj_cmpr.parameters())
-    for name, p in ddp_model.named_parameters():
+    for name, p in model.named_parameters():
         if p not in params:
             p.requires_grad = False
-        else:
+        elif rank==0 and verbose:
             print(name, "gradients on")
 
     if verbose and rank==0:
@@ -132,19 +127,29 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
         optimizer, threshold=0.001, patience=try_key(hyps,"patience",10)
     )
 
-    print("Beginning Training")
+    if hyps["multi_gpu"]:
+      if rank==0 and verbose: print("Putting model on multiple GPUs")
+      ddp_model = DDP(
+            wrapped_model,
+            device_ids=[rank],
+            output_device=rank,
+            find_unused_parameters=True
+      )
+    else: ddp_model = wrapped_model
+
+    if rank==0 and verbose: print("Beginning Training")
     for epoch in range(n_epochs):
-        print("Emptying Trash")
         epochtime = time.time()
         torch.cuda.empty_cache()
         if rank==0 and verbose:
+            print("Emptying Trash")
             print()
             s = "Beginning Epoch {} - {}".format(
                 epoch, hyps["save_folder"]
             )
             print(s)
             logstr = s + "\n"
-        wrapped_model.train()
+        ddp_model.train()
         avg_loss = 0
         avg_acc = 0
         rmb_avg_loss = 0
@@ -168,7 +173,7 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
             #                           k,v in data.items()
             #  }
 
-            package = wrapped_model(
+            package = ddp_model(
                 data,
                 ret_preds=True,
                 seq_len=hyps["seq_len"],
@@ -196,7 +201,7 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
                 #print()
                 if hyps.get("grad_clip",0) > 0:
                     torch.nn.utils.clip_grad_norm_(
-                        wrapped_model.parameters(), hyps["grad_clip"]
+                        ddp_model.parameters(), hyps["grad_clip"]
                     )
                 optimizer.step()
                 optimizer.zero_grad()
@@ -310,7 +315,7 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
         csl_avg_loss = 0
         csl_avg_acc = 0
         if rank==0 and epoch%val_mod==0:
-            wrapped_model.eval()
+            ddp_model.eval()
             if verbose:
                 print("Validating...")
             with torch.no_grad():
@@ -325,7 +330,7 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
                     #    k: v.to(getattr(torch,hyps["dtype"])) for\
                     #                          k,v in data.items()
                     #  }
-                    package = wrapped_model(
+                    package = ddp_model(
                         data,
                         ret_preds=True,
                         tforce=False,
@@ -459,7 +464,6 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
                     ext=".pt"
                 )
                 save_training_log(hyps, logstr)
-            else: print("NOT SAVING MODEL!!!!")
             scheduler.step(val_loss)
         keys = list(package.keys())
         for k in keys: del package[k]
