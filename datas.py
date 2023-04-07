@@ -97,6 +97,43 @@ def owt_causal_encode(examples, tokenizer, cmp_len=20, seq_len=100,
 
     return {**cmps, **seqs}
 
+def googblog_encode(samples, tokenizer,  cmp_len=20,
+                                         seq_len=100,
+                                         overlap=0,
+                                         min_seq=5,
+                                         model=None):
+    """
+    samples: chunk of hugface dataset from map function
+    tokenizer: huggingface tokenizer
+    cmp_len: int
+        the length of the compression
+    seq_len: int
+        the length of the post compression, sequence chunk that
+        will be processed by the transformer. So, the total
+        predictive sequence will be seq_len+cmp_len tokens long.
+    min_seq: int
+        the minimum length predictive portion. total sequence
+        lengths must be greater than or equal to cmp_len+min_seq
+    overlap: int
+        the number of overlapping tokens from the compression
+        sequence to the rest of the sequence.
+    model: SentenceAutoEncoder or None
+        Will use model to generate output tokens. If None, ignored
+    """
+    text = "\n\n".join([samp for samp in samples["text"]])
+    toks = tokenizer(text, truncation=False, return_tensors="pt")
+    max_len = cmp_len + seq_len
+    trunc = toks["input_ids"].shape[-1]//max_len*max_len
+    for k in toks.keys():
+        toks[k] = toks[k][:,:trunc].reshape(-1, max_len)
+    seqs = {
+      "output_ids": toks["input_ids"][:, cmp_len-overlap:],
+      "output_attn_mask": toks["attention_mask"][:,cmp_len-overlap:],
+    }
+    cmprs = {toks[k][:,:cmp_len] for k in toks}
+    return {**cmprs, **seqs}
+
+
 def get_loaders(hyps, tokenizer, model=None, val_only=False):
     """
     Use this function to get the training and validation loaders.
@@ -142,6 +179,44 @@ def get_loaders(hyps, tokenizer, model=None, val_only=False):
         if hyps.get("rank",0)==0:
             print("Loading data from", val_path)
         valset = datasets.load_from_disk(val_path)
+    elif hyps["dataset"]=="blog_authorship_corpus":
+        encode_fxn = lambda x: googblog_encode(
+            x,
+            tokenizer=tokenizer,
+            cmp_len=hyps["cmp_len"],
+            seq_len=hyps["seq_len"],
+            overlap=hyps.get("seq_overlap",0),
+            model=model
+        )
+        dataset = datasets.load_dataset(
+            hyps["dataset"], split="train",
+            cache_dir=try_key(hyps,"data_cache",None),
+            num_proc=try_key(hyps,"n_data_procs",4)
+        )
+        dataset = dataset.shuffle()
+        abrv = hyps.get("abbrev_len", 300)
+        if hyps["exp_name"]=="test" or (abrv is not None and abrv>0):
+            if abrv is None: abrv = 600
+            dataset = dataset[:abrv]
+            dataset = datasets.Dataset.from_dict(dataset)
+        if hyps.get("rank",0)==0: print("Mapping Encoder Function")
+        bsize = 1000 if model is None else\
+                try_key(hyps,"data_batch_size",100)
+        dataset = dataset.remove_columns(["date", "gender", "age", "horoscope", "job"])
+        dataset = dataset.map(
+            encode_fxn,
+            batched=True,
+            num_proc=try_key(hyps,"n_data_procs",4),
+            remove_columns=["text"],
+            batch_size=bsize
+        )
+        if not val_only:
+            test_size = int(len(dataset)*.2)
+            splt = dataset.train_test_split(test_size=test_size)
+            dataset, valset = splt["train"], splt["test"]
+            if abbrev is None or abbrev>=save_threshold:
+                dataset.save_to_disk(os.path.join(path, "train"))
+                valset.save_to_disk( os.path.join(path, "val")  )
     # Make new data from glue
     elif hyps["dataset"]=="glue":
         encode_fxn = lambda x: pair_encode(
