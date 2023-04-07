@@ -100,8 +100,7 @@ def owt_causal_encode(examples, tokenizer, cmp_len=20, seq_len=100,
 def googblog_encode(samples, tokenizer,  cmp_len=20,
                                          seq_len=100,
                                          overlap=0,
-                                         min_seq=5,
-                                         model=None):
+                                         *args, **kwargs):
     """
     samples: chunk of hugface dataset from map function
     tokenizer: huggingface tokenizer
@@ -130,7 +129,7 @@ def googblog_encode(samples, tokenizer,  cmp_len=20,
       "output_ids": toks["input_ids"][:, cmp_len-overlap:],
       "output_attn_mask": toks["attention_mask"][:,cmp_len-overlap:],
     }
-    cmprs = {toks[k][:,:cmp_len] for k in toks}
+    cmprs = {k: toks[k][:,:cmp_len] for k in toks}
     return {**cmprs, **seqs}
 
 
@@ -202,7 +201,9 @@ def get_loaders(hyps, tokenizer, model=None, val_only=False):
         if hyps.get("rank",0)==0: print("Mapping Encoder Function")
         bsize = 1000 if model is None else\
                 try_key(hyps,"data_batch_size",100)
-        dataset = dataset.remove_columns(["date", "gender", "age", "horoscope", "job"])
+        dataset = dataset.remove_columns(
+            ["date","gender","age","horoscope","job"]
+        )
         dataset = dataset.map(
             encode_fxn,
             batched=True,
@@ -210,7 +211,7 @@ def get_loaders(hyps, tokenizer, model=None, val_only=False):
             remove_columns=["text"],
             batch_size=bsize
         )
-        if not val_only:
+        if not val_only and hyps["exp_name"]!="test":
             test_size = int(len(dataset)*.2)
             splt = dataset.train_test_split(test_size=test_size)
             dataset, valset = splt["train"], splt["test"]
