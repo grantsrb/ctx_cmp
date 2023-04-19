@@ -156,7 +156,9 @@ if __name__=="__main__":
         "tpred_loss": 0,
         "pred_loss": 0,
         "tpred_acc": 0,
+        "tpred_top_k": 0,
         "pred_acc": 0,
+        "pred_top_k": 0,
 
         "trmb_loss": 0,
         "rmb_loss": 0,
@@ -265,6 +267,7 @@ if __name__=="__main__":
     print("TFrce Pred Loss: {} -- Acc: {}".format(
         avgs['tpred_loss'], avgs['tpred_acc']
     ))
+    print("TFrce Pred Top K: {}".format( avgs['tpred_top_k']))
     if hyps["rmb_task"]:
         print("TFrce RMB Loss: {} -- Acc: {}".format(
             avgs['trmb_loss'], avgs['trmb_acc']
@@ -280,6 +283,7 @@ if __name__=="__main__":
         print("Pred Loss: {} -- Acc: {}".format(
             avgs['pred_loss'], avgs['pred_acc']
         ))
+        print("Pred Top K: {}".format( avgs['pred_top_k']))
         if hyps["rmb_task"]:
             print("RMB Loss: {} -- Acc: {}".format(
                 avgs['rmb_loss'], avgs['rmb_acc']
