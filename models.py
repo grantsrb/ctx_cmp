@@ -17,7 +17,7 @@ class SentenceAutoEncoder(torch.nn.Module):
                                              n_tsks=2,
                                              train_embs=False,
                                              proj_cmpr=False,
-                                             proj_hid_size=None,
+                                             proj_hid_mult=None,
                                              sep_cmpr=False,
                                              *args, **kwargs):
         """
@@ -48,9 +48,11 @@ class SentenceAutoEncoder(torch.nn.Module):
             if true, projects the cmpr' representations using a linear
             weight matrix before using them as input to the forward/
             auxiliary tasks.
-        proj_hid_size: int or None
+        proj_hid_mult: int or None
             if an integer value is argued, the projection will use a 2
             layer neural net instead of a single linear projection.
+            this argument specifies the size of the hidden layer as
+            proj_hid_mult*h_size
         sep_cmpr: bool
             if true, an additional embedding is inserted between
             the cmpr token and the compression sequence.
