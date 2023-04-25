@@ -86,11 +86,11 @@ class SentenceAutoEncoder(torch.nn.Module):
         if proj_cmpr:
             if proj_hid_mult and proj_hid_mult>0:
                 hid = proj_hid_mult*hsize
-                self.proj_cmpr = torch.nn.Sequential([
+                self.proj_cmpr = torch.nn.Sequential(
                     torch.nn.Linear(hsize, hid),
                     torch.nn.ReLU(),
                     torch.nn.Linear(hid, hsize)
-                ])
+                )
             else:
                 self.proj_cmpr = torch.nn.Linear(hsize, hsize)
 
