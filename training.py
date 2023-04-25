@@ -82,6 +82,10 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
         tokenizer,
         model=model
     )
+    print("NTrain:", len(dataset))
+    try:
+        print("NVal:", len(valset))
+    except: pass
 
     if verbose and rank==0:
         print("Recording Session")
@@ -152,6 +156,7 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
         ddp_model.train()
         avg_loss = 0
         avg_acc = 0
+        kl_avg_loss = 0
         rmb_avg_loss = 0
         rmb_avg_acc = 0
         csl_avg_loss = 0
@@ -178,7 +183,8 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
                 ret_preds=True,
                 seq_len=hyps["seq_len"],
                 tforce=True,
-                gen_ids=try_key(hyps, "gen_ids", False)
+                gen_ids=try_key(hyps, "gen_ids", False),
+                kl_scale=hyps.get("kl_scale", 0),
             )
             loss = package["loss"]
             acc = package["acc"]
@@ -191,6 +197,8 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
             if "csl_loss" in package:
                 csl_avg_loss += package["csl_loss"].item()
                 csl_avg_acc  += package["csl_acc"].item()
+            if "kl_loss" in package:
+                kl_avg_loss += package["kl_loss"].item()
 
             if i%hyps["n_grad_loops"]==0 or i==len(dataloader)-1:
                 if try_key(hyps,"grad_scaling",False):
@@ -283,6 +291,8 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
         if "csl_loss" in package:
             csl_train_loss = round(csl_avg_loss/div, 5)
             csl_train_acc = round(csl_avg_acc/div, 5)
+        if "kl_loss" in package:
+            kl_train_loss = round(kl_avg_loss/div, 5)
         if rank==0 and verbose:
             print()
             s = "Example Predictions On Training"
@@ -336,7 +346,8 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
                         tforce=False,
                         gen_targs=try_key(hyps, "gen_targs", False),
                         seq_len=hyps["seq_len"],
-                        gen_ids=try_key(hyps, "gen_ids", False)
+                        gen_ids=try_key(hyps, "gen_ids", False),
+                        kl_scale=hyps.get("kl_scale", 0),
                     )
                     loss = package["loss"]
                     acc = package["acc"]
@@ -413,6 +424,10 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
                     )
                     print(s)
                     logstr += s + "\n"
+                if "kl_loss" in package:
+                    s = "KL Train Loss: {}".format( kl_train_loss )
+                    print(s)
+                    logstr += s + "\n"
                 if "csl_loss" in package:
                     s = "CSL Train Loss: {} -CSL Train Acc: {}".format(
                         csl_train_loss, csl_train_acc
@@ -456,6 +471,8 @@ def train(rank, hyps, verbose=True, *args, **kwargs):
                     save_dict["csl_train_acc"] =  csl_train_acc
                     save_dict["csl_val_loss"] =   csl_val_loss
                     save_dict["csl_val_acc"] =    csl_val_acc
+                if "kl_loss" in package:
+                    save_dict["kl_train_loss"] = kl_train_loss
                 ml_utils.save_io.save_checkpt(
                     save_dict=save_dict,
                     save_folder=hyps["save_folder"],

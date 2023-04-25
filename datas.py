@@ -16,6 +16,7 @@ def owt_autoencode(examples, tokenizer, max_seq_len=20):
         max_seq_len: int
             the length of the compression
     """
+    raise NotImplemented
     tokenizer.padding_side = "left"
     cmps = tokenizer(
         examples["text"],
@@ -72,7 +73,7 @@ def owt_causal_encode(examples, tokenizer, cmp_len=20, seq_len=100,
         truncation=True,
         return_tensors="pt"
     )
-    if model is not None:
+    if model:
         device = model.get_device()
         with torch.no_grad():
             output_ids, output_logits = model.causal_lm(
@@ -100,6 +101,7 @@ def owt_causal_encode(examples, tokenizer, cmp_len=20, seq_len=100,
 def googblog_encode(samples, tokenizer,  cmp_len=20,
                                          seq_len=100,
                                          overlap=0,
+                                         model=None,
                                          *args, **kwargs):
     """
     samples: chunk of hugface dataset from map function
@@ -125,10 +127,28 @@ def googblog_encode(samples, tokenizer,  cmp_len=20,
     trunc = toks["input_ids"].shape[-1]//max_len*max_len
     for k in toks.keys():
         toks[k] = toks[k][:,:trunc].reshape(-1, max_len)
-    seqs = {
-      "output_ids": toks["input_ids"][:, cmp_len-overlap:],
-      "output_attn_mask": toks["attention_mask"][:,cmp_len-overlap:],
-    }
+
+    if model:
+        model.eval()
+        device = model.get_device()
+        with torch.no_grad():
+            output_ids, output_logits = model.causal_lm(
+                input_ids=toks["input_ids"].to(device),
+                attention_mask=toks["attention_mask"].to(device),
+                tforce=True,
+                ret_logits=True
+            )
+        idx = seq_len + overlap
+        seqs = {
+            "output_ids": toks["input_ids"][:,-idx:],
+            "output_logits": output_logits[:,-idx:].data,
+            "output_attn_mask": toks["attention_mask"][:,-idx:]
+        }
+    else:
+        seqs = {
+          "output_ids": toks["input_ids"][:, cmp_len-overlap:],
+          "output_attn_mask": toks["attention_mask"][:,cmp_len-overlap:],
+        }
     cmprs = {k: toks[k][:,:cmp_len] for k in toks}
     return {**cmprs, **seqs}
 
@@ -146,7 +166,7 @@ def get_loaders(hyps, tokenizer, model=None, val_only=False):
         hyps,"data_root",hyps["save_root"]+"datasplits"
     )
     dset = hyps["dataset"]
-    if hyps.get("gen_targs", False):
+    if hyps.get("gen_targs", False) or hyps.get("kl_scale",0)>0:
         dset += "modelgen"
         model.eval()
         hyps["n_data_procs"] = 1
@@ -211,7 +231,7 @@ def get_loaders(hyps, tokenizer, model=None, val_only=False):
             remove_columns=["text"],
             batch_size=bsize
         )
-        if not val_only and hyps["exp_name"]!="test":
+        if not val_only:
             test_size = int(len(dataset)*.2)
             splt = dataset.train_test_split(test_size=test_size)
             dataset, valset = splt["train"], splt["test"]
@@ -309,7 +329,8 @@ def get_loaders(hyps, tokenizer, model=None, val_only=False):
         return dataset, valset, dataloader, valloader
     return dataset, dataloader
 
-def glue_encode(examples, tokenizer, max_seq_len=100):
+def glue_encode(examples, tokenizer, max_seq_len=100, *args, **kwargs):
+    raise NotImplemented
     tokenizer.padding_side = "left"
     inpts = tokenizer(
         examples["sentence1"],

@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 from transformers import AutoModelForCausalLM
 import numpy as np
 import ml_utils.utils as utils
@@ -159,7 +160,7 @@ class SentenceAutoEncoder(torch.nn.Module):
         cmp_embs = self.embs.weight[self.cmp_ids[0]:self.cmp_ids[-1]+1]
         cat_list.append( cmp_embs[None].repeat(len(inpt_embs),1,1) )
         inpt_embs = torch.cat( cat_list, dim=1 )
-        attention_mask = torch.nn.functional.pad(
+        attention_mask = F.pad(
             attention_mask, (0, self.n_cmps+int(self.sep_cmpr))
         )
 
@@ -184,7 +185,7 @@ class SentenceAutoEncoder(torch.nn.Module):
             logits = model.lm_head(logits.reshape(-1,shape[-1]))
             emb = model_embs.weight
             if not self.train_embs: emb = emb.data
-            cmpr = torch.nn.functional.softmax(
+            cmpr = F.softmax(
                 logits.reshape(-1, logits.shape[-1]), dim=-1
             )
             cmpr = torch.mm(cmpr, emb)
@@ -256,7 +257,7 @@ class SentenceAutoEncoder(torch.nn.Module):
             dim=1
         )
         npad = out_embs.shape[1] - data["output_attn_mask"].shape[1]
-        attn = torch.nn.functional.pad(
+        attn = F.pad(
             data["output_attn_mask"], (npad,0), value=1
         )
         preds = model(inputs_embeds=out_embs,attention_mask=attn).logits
@@ -275,7 +276,7 @@ class SentenceAutoEncoder(torch.nn.Module):
                 dim=1
             )
             npad = out_embs.shape[1] - data["attention_mask"].shape[1]
-            attn = torch.nn.functional.pad(
+            attn = F.pad(
                 data["attention_mask"], (npad,0), value=1
             )
             rmb_preds = model(
@@ -361,7 +362,7 @@ class SentenceAutoEncoder(torch.nn.Module):
             logits.append(ret.logits[:,-1:])
 
             pred = logits[-1][:,-1]
-            pred = torch.nn.functional.softmax(pred/temperature,dim=-1)
+            pred = F.softmax(pred/temperature,dim=-1)
             pred = torch.multinomial(pred,1,replacement=True)
             preds.append(pred)
             out_embs = t_embs( pred.to(self.rank) )
@@ -469,7 +470,7 @@ class SentenceAutoEncoder(torch.nn.Module):
                 preds.append( input_ids[:,1:].to(logit.get_device()) )
             logits.append(logit[:,-1:])
             pred = logit[:,-1]
-            pred = torch.nn.functional.softmax(pred/temperature,dim=-1)
+            pred = F.softmax(pred/temperature,dim=-1)
             pred = torch.multinomial(pred,1,replacement=True)
             preds.append(pred)
             inputs_embeds = t_embs( pred.to(self.rank) )
@@ -508,6 +509,7 @@ class LossWrapper(torch.nn.Module):
                                              gen_targs=False,
                                              gen_ids=False,
                                              no_grad=False,
+                                             kl_scale=0,
                                              temperature=1.,
                                              top_k=5):
         """
@@ -523,6 +525,13 @@ class LossWrapper(torch.nn.Module):
                     token should be appended to the end of each sentence
                 "output_attn_mask": LongTensor (B,S2)
                     attention mask for padding purposes. 0s mean padding.
+
+                optional:
+                    "og_outputs": FloatTensor (B,S2)
+                        the original model's outputs on this sequence.
+                        if present, the loss will include an additional
+                        kl divergence term to keep model predictions
+                        similar to the original model.
             seq_len: int
                 the length of the output sequence.
             ret_preds: bool
@@ -536,6 +545,9 @@ class LossWrapper(torch.nn.Module):
             gen_ids: bool
                 if true, the model will use the generated ids rather than
                 the logits as the ground truth
+            kl_scale: float
+                the scale of the kl divergence loss between the og
+                model and the current model.
             temperature: float
                 a temperature parameter for softmax sampling. Set to
                 low number for high confidence sampling, high value
@@ -599,7 +611,7 @@ class LossWrapper(torch.nn.Module):
         else:
             preds = self.model(data, tforce=tforce)
 
-        if gen_ids or "output_logits" not in data:
+        if gen_ids or "output_logits" not in data or kl_scale>0:
             landa = loss_and_acc(
                 preds, data["output_ids"], attn=data["output_attn_mask"],
                 loss_fxn=self.loss_fxn, loss_scale=self.loss_scale,
@@ -613,7 +625,7 @@ class LossWrapper(torch.nn.Module):
             ps = preds.reshape(-1, preds.shape[-1])
             labels = data["output_ids"].reshape(-1)
             target = data["output_logits"]
-            target = target.reshape(-1, output_logits.shape[-1])
+            target = target.reshape(-1, target.shape[-1])
             loss = self.loss_fxn(ps, target)*self.loss_scale
             argmax = torch.argmax(ps, dim=-1)
             acc = (argmax==labels).float().mean()
@@ -621,6 +633,18 @@ class LossWrapper(torch.nn.Module):
             ret_dict["acc"] = acc
 
         sum_loss = loss
+        if "output_logits" in data and kl_scale>0:
+            targs = data["output_logits"].log_softmax(-1)
+            ps = preds.log_softmax(-1)
+            kl_loss = kl_scale*F.kl_div(
+                ps,
+                targs,
+                reduction="batchmean",
+                log_target=True
+            )
+            ret_dict["kl_loss"] = kl_loss
+            sum_loss += kl_loss
+
         if self.training and not no_grad:
             if self.hyps["rmb_task"]: sum_loss += rmb_loss
             sum_loss.backward()
@@ -664,6 +688,7 @@ class LossWrapper(torch.nn.Module):
             ret_dict["csl_top_k"] = landa["top_k"]
             if ret_preds:
                 ret_dict["csl_preds"] = preds
+
         return ret_dict
 
 def loss_and_acc(preds, labels, attn, loss_fxn, loss_scale=1,top_k=None):
