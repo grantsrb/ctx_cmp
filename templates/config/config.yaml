@@ -1,0 +1,28 @@
+hydra:
+  run:
+    dir: ./outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  # sweep:
+  #   dir: .
+  #   subdir: .
+  # job_logging:
+  #   root:
+  #     level: INFO
+  job:
+    env_set:
+      TOKENIZERS_PARALLELISM: "false"
+      CUDA_VISIBLE_DEVICES: "0,1"  # make sure to keep this number small to avoid crash on ccn!
+
+defaults:
+  - base_config
+  - _self_
+
+model:
+  model_name_or_path: bigscience/bloomz-560m # tiny model for debugging 
+  # cache_dir: .cache/ # only uncomment this if not working on ccn otherwise crash in home directory!
+
+# training:
+#   generation_max_length: 128
+
+data:
+  dataset_name: stas/openwebtext-10k # small version of
+  cache_dir: .cache/
