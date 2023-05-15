@@ -1,2 +1,0 @@
-[2023-05-14 18:33:44,216][arguments][INFO] - Running on DN0a22142e.SUNet
-[2023-05-14 18:33:50,676][datasets.builder][WARNING] - Setting num_proc from 4 back to 1 for the train split to disable multiprocessing as it only contains one shard.
