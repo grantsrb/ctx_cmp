@@ -82,6 +82,8 @@ def owt_causal_encode(examples, tokenizer, cmp_len=20, seq_len=100,
                 tforce=True,
                 ret_logits=True
             )
+            output_ids = output_ids.cpu()
+            output_logits = output_logits.cpu()
         idx = seq_len + overlap
         seqs = {
             "output_ids": cmps["input_ids"][:,-idx:],
@@ -121,6 +123,7 @@ def googblog_encode(samples, tokenizer,  cmp_len=20,
     model: SentenceAutoEncoder or None
         Will use model to generate output tokens. If None, ignored
     """
+    torch.cuda.empty_cache()
     text = "\n\n".join([samp for samp in samples["text"]])
     toks = tokenizer(text, truncation=False, return_tensors="pt")
     max_len = cmp_len + seq_len
@@ -132,12 +135,20 @@ def googblog_encode(samples, tokenizer,  cmp_len=20,
         model.eval()
         device = model.get_device()
         with torch.no_grad():
+            inpt = toks["input_ids"].to(device)
+            mask = toks["attention_mask"].to(device)
             output_ids, output_logits = model.causal_lm(
-                input_ids=toks["input_ids"].to(device),
-                attention_mask=toks["attention_mask"].to(device),
+                input_ids=inpt,
+                attention_mask=mask,
                 tforce=True,
                 ret_logits=True
             )
+            inpt = inpt.cpu()
+            toks["input_ids"] = inpt
+            mask = mask.cpu()
+            toks["attention_mask"] = mask
+            output_ids = output_ids.cpu()
+            output_logits = output_logits.cpu()
         idx = seq_len + overlap
         seqs = {
             "output_ids": toks["input_ids"][:,-idx:],
@@ -150,6 +161,7 @@ def googblog_encode(samples, tokenizer,  cmp_len=20,
           "output_attn_mask": toks["attention_mask"][:,cmp_len-overlap:],
         }
     cmprs = {k: toks[k][:,:cmp_len] for k in toks}
+    torch.cuda.empty_cache()
     return {**cmprs, **seqs}
 
 
@@ -213,14 +225,16 @@ def get_loaders(hyps, tokenizer, model=None, val_only=False):
             num_proc=try_key(hyps,"n_data_procs",4)
         )
         dataset = dataset.shuffle()
+        print("Total Length:", len(dataset))
         abrv = hyps.get("abbrev_len", 300)
         if hyps["exp_name"]=="test" or (abrv is not None and abrv>0):
             if abrv is None: abrv = 600
             dataset = dataset[:abrv]
             dataset = datasets.Dataset.from_dict(dataset)
         if hyps.get("rank",0)==0: print("Mapping Encoder Function")
-        bsize = 1000 if model is None else\
-                try_key(hyps,"data_batch_size",100)
+        print("Processing Length:", len(dataset))
+        bsize=1000 if model is None else hyps.get("data_batch_size",100)
+        print("Batch Size:", bsize)
         dataset = dataset.remove_columns(
             ["date","gender","age","horoscope","job"]
         )
