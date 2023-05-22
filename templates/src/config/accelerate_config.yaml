@@ -1,0 +1,19 @@
+# need to add this argumentto command line to keep the file in the local directory --config_file="./config/accelerate_config.yaml"
+# this file here is only relevant for cpu training and we may be able to just copy paste these arguments into the main config.yaml + arguments.py
+# will lso have to run the command accelerate config --config_file="./acc_config.yaml again to regenerate these for a specific machine/node(s)
+compute_environment: LOCAL_MACHINE
+distributed_type: 'NO'
+downcast_bf16: 'no'
+dynamo_config:
+  dynamo_backend: INDUCTOR
+machine_rank: 0
+main_training_function: main
+mixed_precision: 'no'
+num_machines: 1
+num_processes: 1
+rdzv_backend: static
+same_network: true
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false

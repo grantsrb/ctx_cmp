@@ -2,7 +2,6 @@ from abc import ABC, abstractmethod
 from typing import (
     Dict,
     Optional,
-    Any,
 )
 
 import torch
@@ -19,16 +18,9 @@ class AbstractSentenceAutoEncoder(ABC, torch.nn.Module):
 
     @property
     @abstractmethod
-    def device(self) -> torch.device:
+    def get_device(self) -> torch.device:
         """
         Returns the device of the hf_model.
-        """
-        raise NotImplementedError()
-
-    @abstractmethod
-    def add_attrs(self, new_attrs: Dict[str, Any]) -> None:
-        """
-        Adds new attributes to the model.
         """
         raise NotImplementedError()
 
@@ -40,9 +32,10 @@ class AbstractSentenceAutoEncoder(ABC, torch.nn.Module):
         raise NotImplementedError()
 
     @abstractmethod
-    def add_embeddings(self, n_embs: int) -> None:
+    def add_embeddings(self, 
+                       new_embs: int) -> None:
         """
-        Adds or resizes hf_model token embeddings shape to n + n_embs.
+        Adds or resizes hf_model token embeddings shape to n_embs + new_embs.
         """
         raise NotImplementedError()
 
@@ -54,27 +47,43 @@ class AbstractSentenceAutoEncoder(ABC, torch.nn.Module):
                  **kwargs) -> torch.tensor:
         """
         Compresses the input ids to a single vector.
+
+        Args: 
+            input_ids: LongTensor of shape [args.data.batch_size, args.compression.cmp_len]
+                the token indices of the input sequence. The CMP token
+                should be appended to the end of each sentence.
+            attention_mask: LongTensor of shape [args.data.batch_size, args.compression.cmp_len]
+                attention mask for padding purposes. 0s mean padding.
+        Returns:
+            cmpr: torch.tensor of shape [args.data.batch_sizee, 1, n_embs)
+                the compressed representations
         """
         raise NotImplementedError()
 
     @abstractmethod
     def forward(self,
                 data: Dict[str, torch.LongTensor],
-                tforce: bool) -> torch.tensor:
+                ) -> torch.tensor: # shape: [batch_size, seq_len, n_embs]
         """
-        Runs the forward pass.
+        Args:
+          data: dict
+            "input_ids": LongTensor of shape [args.data.batch_size, args.compression.cmp_len]
+                the token indices of the input sequence. The CMP token
+                should be appended to the end of each sentence.
+            "attention_mask": LongTensor of shape [args.data.batch_size, args.compression.cmp_len]
+                attention mask for padding purposes. 0s mean padding.
+            "output_ids": LongTensor of shape [args.data.batch_size, args.compression.seq_len]
+                the token indices of the target sequence. An EOS token
+                should be appended to the end of each sentence
+            "output_attn_mask": LongTensor of shape [args.data.batch_size, args.compression.seq_len]
+                attention mask for padding purposes. 0s mean padding.
+        Returns:
+            preds: tensor [batch_size, seq_len, vocab_size]
         """
         raise NotImplementedError()
-
+    
     @abstractmethod
-    def infer(self,
-              data: Dict[str, torch.LongTensor],
-              pred_len: Optional[int],
-              rmb_task: bool,
-              temperature: float,
-              ret_logits: bool,
-              ret_embs: bool,
-              cmpr: Optional[torch.tensor]) -> Dict[str, torch.tensor]:
+    def infer(self):
         """
         Performs inference without teacher forcing.
         """
@@ -83,14 +92,20 @@ class AbstractSentenceAutoEncoder(ABC, torch.nn.Module):
     @abstractmethod
     def causal_lm(self,
                   input_ids: torch.LongTensor,
+                  attention_mask: torch.LongTensor,
                   inputs_embeds: torch.FloatTensor,
-                  tforce: bool,
-                  seed_len: Optional[int],
-                  pred_len: Optional[int],
-                  ret_logits: bool,
-                  temperature: float) -> torch.tensor:
+                 ) -> torch.tensor:
         """
         Performs traditional causal language modeling with or without teacher forcing.
+        Args:
+            input_ids: LongTensor shape: [batch_size, seq_len]
+                the token indices of the input sequence. The CMP token
+                should be appended to the end of each sentence. 
+            attention_mask: LongTensor shape: [batch_size, seq_len]
+                attention mask for padding purposes. 0s mean padding.
+            inputs_embeds: FloatTensor shape: [batch_size, seq_len, n_embs]
+                the embeddings of the inputs. If both input_ids and
+                this is argued, input_ids takes priority
         """
         raise NotImplementedError()
     
