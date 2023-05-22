@@ -1,0 +1,13 @@
+{
+    "combos": {
+        "rmb_task": [
+            true
+        ],
+        "train_embs": [
+            false
+        ],
+        "train_lmhead": [
+            true
+        ]
+    }
+}

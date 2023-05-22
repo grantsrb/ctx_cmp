@@ -1,0 +1,62 @@
+{
+    "exp_name":  "bloom560mproj_kl_search",
+    "save_root":  "/data2/pdp/grantsrb/sa_saves/",
+    "data_root":  "/data2/pdp/grantsrb/datasplits/",
+    "data_cache": "/data2/pdp/grantsrb/.cache",
+    "model_string":  "gpt2",
+    "_model_string": "bigscience/bloomz-560m",
+    "test_model_str": null,
+    "multi_gpu": false,
+    "model_parallel": true,
+    "torch_dtype": "float32",
+    "seed": 123456,
+
+    "dataset": "openwebtext",
+    "_dataset": "blog_authorship_corpus",
+    "abbrev_len":   1000000,
+    "n_data_procs": 4,
+    "gen_targs": false,
+    "gen_ids":   false,
+    "data_batch_size": 64,
+
+    "max_val_loops": 500,
+    "n_train_loops": 10000,
+    "checkpt_mod": null,
+
+    "rmb_task": false,
+    "rmb_only": false,
+    "csl_task": false,
+    "csl_scale": 1,
+
+    "train_embs":   false,
+    "train_lmhead": false,
+
+    "n_epochs":       30,
+    "batch_size":     16,
+    "val_batch_size": 50,
+    "lr": 5e-4,
+    "l2": 0,
+    "n_grad_loops": 4,
+    "grad_clip": 0,
+    "grad_scaling": false,
+
+    "kl_scale": 1e-2,
+
+    "n_cmps": 1,
+    "proj_cmpr": true,
+    "proj_hid_mult": 0,
+    "cmp_len": 10,
+    "seq_len": 20,
+    "seq_overlap": 0,
+    "sep_cmpr": false,
+    "cmp_layer": -2,
+
+    "patience": 5,
+
+    "_alternative_model_strings":[
+        "hf-internal-testing/tiny-random-gptj",
+        "EleutherAI/gpt-j-6B",
+        "bigscience/bloomz-560m",
+        "gpt2"
+    ]
+}
