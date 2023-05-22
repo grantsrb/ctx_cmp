@@ -1,0 +1,10 @@
+numpy
+torch
+psutil
+scikit-build
+opencv-python
+pandas
+select
+shutil
+subprocess
+datetime

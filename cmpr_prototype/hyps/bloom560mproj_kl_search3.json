@@ -1,0 +1,16 @@
+{
+    "combos": {
+        "kl_scale": [
+            0.001
+        ],
+        "proj_hid_mult": [
+            4
+        ],
+        "cmp_layer": [
+            -2
+        ],
+        "proj_cmpr": [
+            true
+        ]
+    }
+}

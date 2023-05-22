@@ -1,0 +1,5 @@
+{
+    "proj_cmpr": [true],
+    "cmp_layer": [-2],
+    "kl_scale": [1e-2, 1e-3, 1e-1]
+}
