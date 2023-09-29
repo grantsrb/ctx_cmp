@@ -1,0 +1,49 @@
+# This CITATION.cff file was generated with cffinit.
+# Visit https://bit.ly/cffinit to generate yours today!
+
+cff-version: 1.2.0
+title: Leveraging Large Language Models for Context Compression
+message: >-
+  If you use this software, please cite it using the
+  metadata from this file.
+type: software
+authors:
+  - given-names: Satchel
+    family-names: Grant
+    email: grantsrb@stanford.edu
+    affiliation: Stanford University
+  - given-names: Sahil
+    family-names: Kulkarni
+    email: sahil1@stanford.edu
+    affiliation: Stanford University
+identifiers:
+  - type: url
+    value: >-
+      https://github.com/grantsrb/ctx_cmp/blob/master/Grant-March2023-LeveragingLLMsForContextCompression.pdf
+    description: paper link
+repository-code: 'https://github.com/grantsrb/ctx_cmp/'
+abstract: >-
+  Large Language Models (LLMs) have demonstrated remarkable
+  performance on a wide range of language modeling tasks.
+  LLMs have also demonstrated an ability to learn new tasks
+  from clever prompt sequences, without the need for
+  gradient updates. The length of an LLM's context window,
+  however, has quadratic computational complexity, making
+  large context windows prohibitively expensive.
+  Furthermore, a problem with LLMs as models of cognition is
+  their perfect memory for tokens within their context
+  window, and their non-existant memory for things outside
+  of their context window in the absence of weight updates.
+  To address the challenges of large context windows, we
+  introduce a technique that uses pretrained LLMs to create
+  compressed, representations of sub-sequences within the
+  context. We introduce a new token type that can be trained
+  to compress a history of tokens at inference without
+  additional gradient updates after training. These tokens
+  serve to increase the context size while taking a step
+  toward aligning LLMs with human stimulus abstraction. We
+  use this technique to augment the open source Bloom
+  models, and we show that the compressed representations
+  can recover ~80\% of the performance of the LLMs using the
+  full context.
+license: MIT
